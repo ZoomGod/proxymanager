@@ -2,10 +2,8 @@
 // subdirectory builds the adapter traces these same dependencies under web/.
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
-const repo = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
-const prefix = path.relative(repo, process.cwd());
+const prefix = path.basename(process.cwd());
 const functions = '.next/output/functions';
 let added = 0;
 for (const entry of await readdir(functions, { recursive: true })) {
