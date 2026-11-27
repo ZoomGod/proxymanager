@@ -553,6 +553,66 @@ describe('subscription definition + separate snapshot fail-first CAS', () => {
     expect(values.get('render:profile-a')).toBe('{"configVersion":7}');
   });
 
+  it('supports server-manual without initial snapshot and commits server-origin snapshots atomically', () => {
+    const initialServerManual = JSON.stringify({
+      id: 'entity-1',
+      kind: 'remote',
+      url: 'https://mitce.example/sub',
+      refresh_mode: 'server-manual',
+      fetch_identity_revision: 1,
+    });
+    expect(
+      runSubscription(plan({ sources: [] }), {
+        snapshotAction: 'keep',
+        healthAction: 'delete',
+        mutate: (_keys, args) => {
+          args[2] = initialServerManual;
+        },
+      }),
+    ).toEqual([1, '8']);
+    expect(hash('entities').get('entity-1')).toBe(initialServerManual);
+
+    const refreshedServerManual = JSON.stringify({
+      id: 'entity-1',
+      kind: 'remote',
+      url: 'https://mitce.example/sub',
+      refresh_mode: 'server-manual',
+      fetch_identity_revision: 1,
+      manual_snapshot_meta: {
+        updated_at: 10,
+        proxy_count: 2,
+        info_proxy_count: 0,
+        origin: 'server',
+        fetch_identity_revision: 1,
+        content_sha256: 'a1d0ec66e897879f5c02474d3ca5de8db43d438a7e45c697f6eb0bf0ad1c615e',
+      },
+    });
+    expect(
+      runSubscription(plan({ sources: [] }), {
+        snapshotAction: 'set',
+        healthAction: 'delete',
+        mutate: (_keys, args) => {
+          args[0] = '8';
+          args[2] = refreshedServerManual;
+        },
+      }),
+    ).toEqual([1, '9']);
+    expect(values.get('manual-snapshot')).toBe('raw-content');
+
+    // Keep with meta requires the snapshot key to exist.
+    values.delete('manual-snapshot');
+    expect(
+      runSubscription(plan({ sources: [] }), {
+        snapshotAction: 'keep',
+        healthAction: 'keep',
+        mutate: (_keys, args) => {
+          args[0] = '9';
+          args[2] = refreshedServerManual;
+        },
+      }),
+    ).toEqual([2, 'manual-snapshot-missing']);
+  });
+
   it('atomically replaces the preflighted server-auto fetch cache', () => {
     seedSubscriptionState();
     values.set('fetch-cache', '{"content":"old"}');
@@ -690,6 +750,57 @@ describe('naming CAS executes entity + history + audit + ordinal reservation ato
       ['airport-a:fp-a', '1'],
       ['airport-a:fp-b', '2'],
     ]);
+  });
+
+  it('commits profile filter and exact-reference rewrites with naming history and one version', () => {
+    hash('profile-groups').set('g', '{"filter":"old"}');
+    hash('profile-rules').set('r', '{"policy":"old"}');
+    expect(runNaming(plan(), (keys, args) => {
+      keys.push('profile-groups', 'profile-rules');
+      args.push('1', PROFILE_ID, '1', 'g', '{"filter":"new"}', '1', 'r', '{"policy":"new"}');
+    })).toEqual([1, '8']);
+    expect(hash('profile-groups').get('g')).toBe('{"filter":"new"}');
+    expect(hash('profile-rules').get('r')).toBe('{"policy":"new"}');
+    expect(hash('history').has(`subscription:${RECORD_ID}`)).toBe(true);
+    expect(hash('audit-by-id').has(AUDIT_ID)).toBe(true);
+    expect(values.get('ordinal-generation')).toBe('1');
+  });
+
+  it('atomically inserts and deletes generated groups without touching unrelated records', () => {
+    hash('profile-groups').set('generated', '{"name":"Generated"}');
+    hash('profile-groups').set('keep', '{"name":"Keep"}');
+    expect(runNaming(plan(), (keys, args) => {
+      keys.push('profile-groups', 'profile-rules');
+      args.push('1', PROFILE_ID, '2', 'generated', '__naming_delete__', 'new', '{"name":"New"}', '0');
+    })).toEqual([1, '8']);
+    expect(hash('profile-groups').has('generated')).toBe(false);
+    expect(hash('profile-groups').get('new')).toBe('{"name":"New"}');
+    expect(hash('profile-groups').get('keep')).toBe('{"name":"Keep"}');
+  });
+
+  it('prevalidates all keys before deleting any generated group', () => {
+    hash('profile-groups').set('generated', '{"name":"Generated"}');
+    types.set('profile-rules', 'string');
+    const before = snapshot();
+    expect(runNaming(plan(), (keys, args) => {
+      keys.push('profile-groups', 'profile-rules');
+      args.push('1', PROFILE_ID, '1', 'generated', '__naming_delete__', '0');
+    })[0]).toBe(2);
+    expect(snapshot()).toBe(before);
+  });
+
+  it.each(['wrongtype', 'missing-profile', 'malformed-value'])('prevalidates %s profile patches before any naming/ordinal/audit write', (failure) => {
+    hash('profile-groups').set('g', '{"filter":"old"}');
+    if (failure === 'wrongtype') types.set('profile-rules', 'string');
+    if (failure === 'missing-profile') hash('profiles').delete(PROFILE_ID);
+    const before = snapshot();
+    const result = runNaming(plan(), (keys, args) => {
+      args[11] = 'global';
+      keys.push('profile-groups', 'profile-rules');
+      args.push('1', PROFILE_ID, '1', 'g', '{"filter":"new"}', '1', 'r', failure === 'malformed-value' ? '' : '{"policy":"new"}');
+    });
+    expect(result[0]).toBe(2);
+    expect(snapshot()).toBe(before);
   });
 
   it('global workspace authority commits without a profile row while keeping the version CAS', () => {

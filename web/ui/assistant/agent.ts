@@ -1,43 +1,77 @@
 'use client';
 
-/**
- * Browser-side agent loop for the AI assistant.
- *
- * The model is called directly from the browser with the user's own
- * OpenAI-compatible credentials (GET /assistant/config); the system prompt and
- * tool schemas come from GET /assistant/bootstrap. Every tool call the model
- * makes is executed through POST /assistant/tool, which runs reads inline and
- * turns writes into a one-time confirmation token — nothing is ever written
- * without the user pressing 确认执行 (POST /assistant/confirm).
- *
- * The request body mirrors `lib/ai/deepseek.ts` (model, thinking,
- * reasoning_effort | temperature, max_tokens, tools, tool_choice) with
- * `stream: true`. `reasoning_content` is echoed back on assistant turns, which
- * DeepSeek's thinking mode requires once a turn has made tool calls.
- */
-
-import type { ChatMessage, ToolCall } from '@/lib/ai/deepseek';
-import type { ToolDispatchResult } from '@/lib/ai/toolDispatchTypes';
-import type { DeepSeekTool } from '@/lib/ai/toolSchema';
-import { ApiError, api, errorMessage, request } from '@/ui/data/api';
+import {
+  acquireTakeover,
+  agentTools,
+  beginClosedQueryCleanup,
+  consumeTakeoverRouteDrifted,
+  customTools,
+  executeCustomTool,
+  findCustomTool,
+  getAgent,
+  hasMainSkeletons,
+  isBuiltinOwnerValid,
+  markTakeoverActing,
+  runAgentAct,
+  runAgentQuery,
+  settleRouteCommit,
+  waitForRouteChange,
+  waitIfPaused,
+  type AgentStep,
+  type AppAgent,
+} from '@/ui/agent';
+import { ApiError, api, errorMessage } from '@/ui/data/api';
 import type { AssistantConfig } from '@/ui/data/types';
+import {
+  analyzeToolError,
+  extractOpenOverlays,
+  type RunDiagnosticRecorder,
+  type ToolErrorAnalysis,
+} from './diagnostics';
+import { describeInput } from './labels';
 
-export type { ChatMessage, ToolCall, ToolDispatchResult };
-
-/** Safety cap on model round-trips for one user turn. */
-export const MAX_ROUNDS = 12;
-
-/** Audit label for every assistant-originated tool / confirm call. */
-const AI_HEADERS = { 'X-Source': 'ai_chat' };
-
-/* ─── config + bootstrap ─────────────────────────────────────────────── */
-
-export interface Bootstrap {
-  systemPrompt: string;
-  tools: DeepSeekTool[];
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
 }
 
-/** Assistant config, or null when it has never been set up (404). */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  reasoning_content?: string;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+}
+
+export interface OpenAiTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+export interface ToolDispatchResult {
+  kind: 'snapshot' | 'query' | 'act' | 'custom' | 'error';
+  data: unknown;
+  modelContent: string;
+}
+
+export const MAX_ROUNDS = 40;
+
+export function toOpenAiTools(): OpenAiTool[] {
+  return [...agentTools, ...customTools].map(({ name, description, inputSchema }) => ({
+    type: 'function',
+    function: {
+      name,
+      description,
+      parameters: inputSchema as Record<string, unknown>,
+    },
+  }));
+}
+
 export async function fetchAssistantConfig(): Promise<AssistantConfig | null> {
   try {
     return await api.get<AssistantConfig>('/assistant/config');
@@ -47,24 +81,8 @@ export async function fetchAssistantConfig(): Promise<AssistantConfig | null> {
   }
 }
 
-let bootstrapPromise: Promise<Bootstrap> | null = null;
-
-/** System prompt + tool schemas, fetched once per page session (retried after a failure). */
-export function loadBootstrap(): Promise<Bootstrap> {
-  if (!bootstrapPromise) {
-    bootstrapPromise = api.get<Bootstrap>('/assistant/bootstrap').catch((error: unknown) => {
-      bootstrapPromise = null;
-      throw error;
-    });
-  }
-  return bootstrapPromise;
-}
-
-/* ─── errors ─────────────────────────────────────────────────────────── */
-
 export type ModelErrorKind = 'auth' | 'rate' | 'server' | 'network' | 'request' | 'stream';
 
-/** A failure talking to the model API. Messages are user-facing and never contain the key. */
 export class ModelError extends Error {
   readonly kind: ModelErrorKind;
   readonly status?: number;
@@ -83,7 +101,6 @@ export function isAbortError(error: unknown): boolean {
   );
 }
 
-/** Strip anything that looks like a credential before text reaches the screen. */
 function scrub(text: string, apiKey: string): string {
   let out = text;
   if (apiKey && apiKey.length >= 4) out = out.split(apiKey).join('••••');
@@ -140,9 +157,6 @@ async function httpError(res: Response, config: AssistantConfig): Promise<ModelE
   return new ModelError('request', `模型请求失败（${status}）${suffix}`, status);
 }
 
-/* ─── SSE ────────────────────────────────────────────────────────────── */
-
-/** Incremental `text/event-stream` parser: feeds each event's joined `data:` payload to `onData`. */
 export function createSseParser(onData: (data: string) => void) {
   let buffer = '';
   const dispatch = (block: string) => {
@@ -184,8 +198,6 @@ export function createSseParser(onData: (data: string) => void) {
   };
 }
 
-/* ─── one model round ────────────────────────────────────────────────── */
-
 export interface ModelRound {
   content: string;
   reasoning: string;
@@ -208,14 +220,13 @@ interface StreamedToolCall {
 type Json = Record<string, unknown>;
 const isRecord = (value: unknown): value is Json => !!value && typeof value === 'object' && !Array.isArray(value);
 
-function buildBody(config: AssistantConfig, system: string, tools: DeepSeekTool[], messages: ChatMessage[]) {
+function buildBody(config: AssistantConfig, system: string, tools: OpenAiTool[], messages: ChatMessage[]) {
   const thinking = config.thinking ?? 'enabled';
   const body: Json = {
     model: config.model,
     messages: [{ role: 'system', content: system }, ...messages],
     tools: tools.length ? tools : undefined,
     tool_choice: tools.length ? 'auto' : undefined,
-    // Thinking mode emits reasoning + answer; leave headroom for both.
     max_tokens: config.maxTokens ?? 8192,
     stream: true,
     thinking: { type: thinking },
@@ -225,11 +236,10 @@ function buildBody(config: AssistantConfig, system: string, tools: DeepSeekTool[
   return body;
 }
 
-/** Stream one chat completion. Aborts resolve with `aborted: true` and the partial text. */
 export async function streamModelRound(options: {
   config: AssistantConfig;
   system: string;
-  tools: DeepSeekTool[];
+  tools: OpenAiTool[];
   messages: ChatMessage[];
   signal: AbortSignal;
   onDelta: (delta: RoundDelta) => void;
@@ -317,7 +327,6 @@ export async function streamModelRound(options: {
 
   const contentType = res.headers.get('content-type') ?? '';
   if (!res.body || contentType.includes('application/json')) {
-    // Provider ignored `stream: true` — take the whole message at once.
     let json: unknown;
     try {
       json = await res.json();
@@ -340,7 +349,7 @@ export async function streamModelRound(options: {
       try {
         chunk = JSON.parse(data);
       } catch {
-        return; // keep-alive noise / partial vendor extras
+        return;
       }
       takeChunk(chunk);
     });
@@ -378,76 +387,356 @@ export async function streamModelRound(options: {
   return round;
 }
 
-/* ─── tools + confirmation ───────────────────────────────────────────── */
-
-function errorResult(message: string): ToolDispatchResult {
-  const data = { error: message };
+function errorResult(message: string, analysis?: ToolErrorAnalysis): ToolDispatchResult {
+  const data: Json = {
+    error: message,
+    ...(analysis
+      ? {
+          errorCode: analysis.code,
+          errorCodes: analysis.codes,
+          ...(analysis.hint ? { hint: analysis.hint } : {}),
+        }
+      : {}),
+  };
   return { kind: 'error', data, modelContent: JSON.stringify(data) };
 }
 
-/** Execute one tool call on the server for `profileId`. Never throws except on abort. */
-export async function dispatchTool(
-  profileId: string,
+function attachAnalysis(data: unknown, analysis: ToolErrorAnalysis): unknown {
+  if (!isRecord(data)) return data;
+  return {
+    ...data,
+    errorCode: analysis.code,
+    errorCodes: analysis.codes,
+    ...(analysis.failedStepIndex !== undefined ? { failedStepIndex: analysis.failedStepIndex } : {}),
+    ...(analysis.completedSteps !== undefined ? { completedSteps: analysis.completedSteps } : {}),
+    ...(analysis.hint ? { hint: analysis.hint } : {}),
+  };
+}
+
+function makeAbortError(): Error {
+  return typeof DOMException !== 'undefined'
+    ? new DOMException('Aborted', 'AbortError')
+    : Object.assign(new Error('Aborted'), { name: 'AbortError' });
+}
+
+export async function dispatchAgentTool(
   name: string,
   input: unknown,
-  signal?: AbortSignal,
+  options?: {
+    signal?: AbortSignal;
+    owner?: AbortController;
+    onStop?: () => void;
+    onSideEffectDispatched?: () => void;
+    agent?: AppAgent;
+    diagnostics?: RunDiagnosticRecorder;
+    round?: number;
+    slot?: string;
+  },
 ): Promise<ToolDispatchResult> {
-  try {
-    const res = await request<{ data?: ToolDispatchResult }>('/assistant/tool', {
-      method: 'POST',
-      query: { profileId },
-      body: { name, input },
-      headers: AI_HEADERS,
-      signal,
-    });
-    const result = res?.data;
-    if (!result || typeof result.kind !== 'string' || typeof result.modelContent !== 'string') {
-      return errorResult('工具返回了无法识别的结果。');
+  const target = options?.agent ?? getAgent();
+  const signal = options?.signal;
+  const owner = options?.owner;
+  const diagnostics = options?.diagnostics;
+  const round = options?.round ?? 0;
+  const slot = options?.slot ?? '0:0';
+  const diagBegin = diagnostics?.beginCall(target);
+
+  const safeSnap = () => {
+    try {
+      return target.snapshot();
+    } catch {
+      return [];
     }
-    return result;
+  };
+
+  try {
+    if (name === 'snapshot') {
+      const data = target.snapshot();
+      const loading = hasMainSkeletons();
+      const modelContent = loading
+        ? JSON.stringify({
+            components: data,
+            route: typeof window !== 'undefined' ? window.location.pathname : '',
+            loading: true,
+            hint: '主区域仍有部分骨架屏在加载；已可见的按钮可直接用 act 操作，若目标数据或列表尚未出现，可调用 wait_for 等待其渲染。',
+          })
+        : JSON.stringify(data);
+      if (diagnostics && diagBegin) {
+        diagnostics.finishCall({ round, slot, tool: name, input, status: 'ok', agent: target, begin: diagBegin });
+      }
+      return { kind: 'snapshot', data, modelContent };
+    }
+    if (name === 'query') {
+      const args = isRecord(input) ? input : {};
+      if (args.closed === true) {
+        await waitIfPaused(signal, owner);
+        if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+        let endActing: () => void = () => {};
+        let endCleanup: () => void = () => {};
+        if (owner) {
+          acquireTakeover(owner, { onStop: options?.onStop, activityLabel: '查询隐藏页面内容' });
+          endActing = markTakeoverActing(owner, '查询隐藏页面内容', { mutating: false });
+          endCleanup = beginClosedQueryCleanup(owner);
+        }
+        try {
+          const data = await runAgentQuery(args as Parameters<AppAgent['query']>[0], {
+            signal,
+            source: 'ai_chat',
+            owner,
+            agent: target,
+          });
+          // Discard partial arrays if the run was aborted or expired while SDK restored closed tabs.
+          if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+          if (isRecord(data) && typeof data.error === 'string') {
+            const analysis = analyzeToolError({
+              name,
+              input,
+              data,
+              currentSnapshot: safeSnap(),
+              lastObservedSnapshot: diagnostics?.getLastObservedSnapshot(),
+              recentClosedOverlays: diagnostics?.getRecentClosedOverlays(),
+            });
+            const enriched = attachAnalysis(data, analysis);
+            if (diagnostics && diagBegin) {
+              diagnostics.finishCall({
+                round,
+                slot,
+                tool: name,
+                input,
+                status: 'error',
+                agent: target,
+                begin: diagBegin,
+                analysis,
+              });
+            }
+            return { kind: 'error', data: enriched, modelContent: JSON.stringify(enriched) };
+          }
+          if (diagnostics && diagBegin) {
+            diagnostics.finishCall({ round, slot, tool: name, input, status: 'ok', agent: target, begin: diagBegin });
+          }
+          return { kind: 'query', data, modelContent: JSON.stringify(data) };
+        } finally {
+          endActing();
+          endCleanup();
+        }
+      }
+      const data = await runAgentQuery(args as Parameters<AppAgent['query']>[0], {
+        signal,
+        source: 'ai_chat',
+        owner,
+        agent: target,
+      });
+      if (isRecord(data) && typeof data.error === 'string') {
+        const analysis = analyzeToolError({
+          name,
+          input,
+          data,
+          currentSnapshot: safeSnap(),
+          lastObservedSnapshot: diagnostics?.getLastObservedSnapshot(),
+          recentClosedOverlays: diagnostics?.getRecentClosedOverlays(),
+        });
+        const enriched = attachAnalysis(data, analysis);
+        if (diagnostics && diagBegin) {
+          diagnostics.finishCall({
+            round,
+            slot,
+            tool: name,
+            input,
+            status: 'error',
+            agent: target,
+            begin: diagBegin,
+            analysis,
+          });
+        }
+        return { kind: 'error', data: enriched, modelContent: JSON.stringify(enriched) };
+      }
+      if (diagnostics && diagBegin) {
+        diagnostics.finishCall({ round, slot, tool: name, input, status: 'ok', agent: target, begin: diagBegin });
+      }
+      return { kind: 'query', data, modelContent: JSON.stringify(data) };
+    }
+    if (name === 'act') {
+      await waitIfPaused(signal, owner);
+      if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+      const validSteps = isRecord(input) && Array.isArray(input.steps) && input.steps.length > 0;
+      const label = describeInput('act', input) ?? '操作页面';
+      let endActing: () => void = () => {};
+      if (validSteps && owner) {
+        acquireTakeover(owner, { onStop: options?.onStop, activityLabel: label });
+        endActing = markTakeoverActing(owner, label, { mutating: true });
+      }
+      const beforePath = typeof window !== 'undefined' ? window.location.pathname : '';
+      let navigationIntent = false;
+      let expectedPath: string | undefined;
+      try {
+        if (validSteps) options?.onSideEffectDispatched?.();
+        const data = await runAgentAct(input as { steps: AgentStep[] }, {
+          signal,
+          source: 'ai_chat',
+          owner,
+          agent: target,
+          onNavigationIntent: (nextPath) => {
+            navigationIntent = true;
+            expectedPath = nextPath;
+          },
+        });
+        if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+        const ok = !(isRecord(data) && data.ok === false);
+        if (ok && navigationIntent && typeof window !== 'undefined' && window.location.pathname === beforePath) {
+          await waitForRouteChange(beforePath, { signal, expectedPath });
+          if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+        }
+        const afterPath = typeof window !== 'undefined' ? window.location.pathname : '';
+        const navigated = Boolean(beforePath && afterPath && afterPath !== beforePath);
+        if (ok && navigated) {
+          await settleRouteCommit(signal);
+          if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+        }
+        if (!ok) {
+          const analysis = analyzeToolError({
+            name,
+            input,
+            data,
+            currentSnapshot: safeSnap(),
+            lastObservedSnapshot: diagnostics?.getLastObservedSnapshot(),
+            recentClosedOverlays: diagnostics?.getRecentClosedOverlays(),
+          });
+          const enriched = attachAnalysis(data, analysis);
+          if (diagnostics && diagBegin) {
+            diagnostics.finishCall({
+              round,
+              slot,
+              tool: name,
+              input,
+              status: 'error',
+              agent: target,
+              begin: diagBegin,
+              analysis,
+            });
+          }
+          return { kind: 'error', data: enriched, modelContent: JSON.stringify(enriched) };
+        }
+        const reportedOpen = isRecord(data)
+          ? extractOpenOverlays([
+              ...(Array.isArray(data.open) ? (data.open as Parameters<typeof extractOpenOverlays>[0]) : []),
+              ...(Array.isArray(data.appeared) ? (data.appeared as Parameters<typeof extractOpenOverlays>[0]) : []),
+            ])
+          : [];
+        const finished = diagnostics && diagBegin
+          ? diagnostics.finishCall({
+              round,
+              slot,
+              tool: name,
+              input,
+              status: 'ok',
+              agent: target,
+              begin: diagBegin,
+              navigated,
+              navigationPending: navigationIntent && !navigated,
+              reportedOpenOverlays: reportedOpen,
+            })
+          : { closedBeforeReturn: [] };
+        const overlayClosedNote =
+          !navigated && finished.closedBeforeReturn.length > 0
+            ? `注意：刚才打开的浮层（${finished.closedBeforeReturn.map((o) => o.label || o.component).join('、')}）在返回前已关闭，下一步操作前请先重新打开或调用 snapshot 确认。`
+            : undefined;
+        let modelContent: string;
+        if (navigated && isRecord(data)) {
+          // Drop stale pre-navigation form values so the model sees the new route cleanly.
+          const { values: _staleValues, ...rest } = data;
+          void _staleValues;
+          modelContent = JSON.stringify({
+            ...rest,
+            route: afterPath,
+            navigated: { from: beforePath, to: afterPath },
+            loading: hasMainSkeletons(),
+          });
+        } else if (navigationIntent && isRecord(data)) {
+          modelContent = JSON.stringify({
+            ...data,
+            route: afterPath,
+            navigationPending: true,
+            ...(overlayClosedNote ? { note: overlayClosedNote } : {}),
+          });
+        } else if (overlayClosedNote && isRecord(data)) {
+          modelContent = JSON.stringify({ ...data, note: overlayClosedNote });
+        } else {
+          modelContent = JSON.stringify(data);
+        }
+        return { kind: 'act', data, modelContent };
+      } finally {
+        endActing();
+      }
+    }
+    const custom = findCustomTool(name);
+    if (custom) {
+      if (custom.effect === 'write') {
+        await waitIfPaused(signal, owner);
+        if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+      }
+      const data = await executeCustomTool(name, input, {
+        signal,
+        source: 'ai_chat',
+        owner,
+        agent: target,
+        onWriteDispatched: custom.effect === 'write' ? options?.onSideEffectDispatched : undefined,
+      });
+      if (signal?.aborted || !isBuiltinOwnerValid(owner)) throw makeAbortError();
+      if (isRecord(data) && data.ok === false) {
+        const analysis = analyzeToolError({ name, data, currentSnapshot: [] });
+        const enriched = attachAnalysis(data, analysis);
+        if (diagnostics && diagBegin) {
+          diagnostics.finishCall({
+            round,
+            slot,
+            tool: name,
+            input,
+            status: 'error',
+            agent: target,
+            begin: diagBegin,
+            analysis,
+          });
+        }
+        return { kind: 'error', data: enriched, modelContent: JSON.stringify(enriched) };
+      }
+      if (diagnostics && diagBegin) {
+        diagnostics.finishCall({ round, slot, tool: name, input, status: 'ok', agent: target, begin: diagBegin });
+      }
+      return { kind: 'custom', data, modelContent: JSON.stringify(data) };
+    }
+    const unknownAnalysis: ToolErrorAnalysis = { code: 'invalid_args', codes: ['invalid_args'] };
+    if (diagnostics && diagBegin) {
+      diagnostics.finishCall({
+        round,
+        slot,
+        tool: name,
+        input,
+        status: 'error',
+        agent: target,
+        begin: diagBegin,
+        analysis: unknownAnalysis,
+      });
+    }
+    return errorResult(`未知工具：${name}`, unknownAnalysis);
   } catch (error) {
     if (signal?.aborted || isAbortError(error)) throw error;
-    return errorResult(errorMessage(error));
+    const errAnalysis: ToolErrorAnalysis = { code: 'unknown', codes: ['unknown'] };
+    if (diagnostics && diagBegin) {
+      diagnostics.finishCall({
+        round,
+        slot,
+        tool: name,
+        input,
+        status: 'error',
+        agent: target,
+        begin: diagBegin,
+        analysis: errAnalysis,
+      });
+    }
+    return errorResult(errorMessage(error), errAnalysis);
   }
 }
 
-export type ConfirmOutcome =
-  | { kind: 'write-result'; summary: string; op: string; undoable: boolean; modelContent: string }
-  | { kind: 'unknown-outcome'; modelContent: string };
-
-/** Run an authorised write. Throws ApiError (409 = token expired/used, 422 = rejected …). */
-export async function confirmWrite(token: string): Promise<ConfirmOutcome> {
-  const res = await request<{ data?: Json }>('/assistant/confirm', {
-    method: 'POST',
-    body: { token },
-    headers: AI_HEADERS,
-  });
-  const payload = isRecord(res?.data) ? res.data : {};
-  const modelContent =
-    typeof payload.modelContent === 'string'
-      ? payload.modelContent
-      : 'The write outcome is unknown. Do not retry automatically; re-read the target profile to verify the current state.';
-  if (payload.kind === 'write-result' && isRecord(payload.data)) {
-    const data = payload.data;
-    const events = Array.isArray(data.events) ? data.events : [];
-    return {
-      kind: 'write-result',
-      summary: typeof data.summary === 'string' ? data.summary : '',
-      op: typeof data.op === 'string' ? data.op : '',
-      undoable: events.some((event) => isRecord(event) && event.undoable === true),
-      modelContent,
-    };
-  }
-  return { kind: 'unknown-outcome', modelContent };
-}
-
-/* ─── transcript hygiene ─────────────────────────────────────────────── */
-
-/**
- * Make a transcript valid for the API: every assistant tool call gets a tool
- * reply (calls cut short by a reload or a stop are answered as interrupted)
- * and stray tool replies are dropped.
- */
 export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   let open: string[] = [];
@@ -473,8 +762,6 @@ export function repairTranscript(messages: ChatMessage[]): ChatMessage[] {
   return out;
 }
 
-/* ─── the loop ───────────────────────────────────────────────────────── */
-
 export type AgentEvent =
   | { type: 'round-start'; round: number }
   | { type: 'reasoning'; text: string }
@@ -491,40 +778,41 @@ export const slotId = (round: number, index: number) => `${round}:${index}`;
 
 const INTERRUPTED_NOTE = '（用户中断了这次回答）';
 
-/**
- * Run the model ↔ tool loop until the model answers without tool calls, the
- * user stops it, or MAX_ROUNDS is reached. The transcript is reported through
- * `transcript` events as it grows, so a thrown error never loses progress.
- */
 export async function runAgent(options: {
   config: AssistantConfig;
-  bootstrap: Bootstrap;
-  /** Extra context appended to the system prompt (active profile …). */
-  context: string;
-  profileId: string;
+  system: string;
+  tools?: OpenAiTool[];
   messages: ChatMessage[];
   signal: AbortSignal;
+  owner?: AbortController;
+  onStop?: () => void;
+  agent?: AppAgent;
+  diagnostics?: RunDiagnosticRecorder;
   onEvent: (event: AgentEvent) => void;
 }): Promise<AgentStatus> {
-  const { config, bootstrap, profileId, signal, onEvent } = options;
-  const system = `${bootstrap.systemPrompt}${options.context}`;
+  const { config, system, signal, owner, onStop, agent, diagnostics, onEvent } = options;
+  const tools = options.tools ?? toOpenAiTools();
   const convo = repairTranscript(options.messages);
   const commit = () => onEvent({ type: 'transcript', messages: [...convo] });
 
   const interrupt = (partial: string) => {
     convo.push({ role: 'assistant', content: partial ? `${partial}\n\n${INTERRUPTED_NOTE}` : INTERRUPTED_NOTE });
-    // Calls that never ran still need a reply before the next request.
     onEvent({ type: 'transcript', messages: repairTranscript(convo) });
     return 'interrupted' as const;
   };
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
+    try {
+      await waitIfPaused(signal, owner);
+    } catch {
+      return interrupt('');
+    }
     if (signal.aborted) return interrupt('');
     onEvent({ type: 'round-start', round });
     const turn = await streamModelRound({
       config,
       system,
-      tools: bootstrap.tools,
+      tools,
       messages: convo,
       signal,
       onDelta: (delta) => {
@@ -545,6 +833,11 @@ export async function runAgent(options: {
     if (!turn.toolCalls.length) return 'done';
 
     for (const [index, call] of turn.toolCalls.entries()) {
+      try {
+        await waitIfPaused(signal, owner);
+      } catch {
+        return interrupt('');
+      }
       const slot = slotId(round, index);
       const name = call.function.name;
       let input: unknown = {};
@@ -554,18 +847,53 @@ export async function runAgent(options: {
       } catch {
         parseFailed = true;
       }
-      if (signal.aborted) {
-        // Unanswered calls are closed out by repairTranscript.
-        return interrupt('');
-      }
+      if (signal.aborted) return interrupt('');
       onEvent({ type: 'tool-start', slot, name, input });
       let result: ToolDispatchResult;
       if (parseFailed) {
-        result = errorResult('工具参数不是合法的 JSON，请重新生成参数后再调用。');
+        result = errorResult('工具参数不是合法的 JSON，请重新生成参数后再调用。', {
+          code: 'invalid_args',
+          codes: ['invalid_args'],
+        });
+      } else if (name !== 'snapshot' && consumeTakeoverRouteDrifted()) {
+        result = errorResult('暂停期间页面或配置已切换，请先调用 snapshot 重新确认当前页面后再继续。', {
+          code: 'overlay_closed',
+          codes: ['overlay_closed'],
+        });
       } else {
+        let sideEffectDispatched = false;
         try {
-          result = await dispatchTool(profileId, name, input, signal);
+          result = await dispatchAgentTool(name, input, {
+            signal,
+            owner,
+            onStop,
+            agent,
+            diagnostics,
+            round,
+            slot,
+            onSideEffectDispatched: () => {
+              sideEffectDispatched = true;
+            },
+          });
         } catch {
+          const abortedResult = sideEffectDispatched
+            ? {
+                kind: 'error' as const,
+                data: {
+                  interrupted: true,
+                  status: 'dispatched_unverified',
+                  error: '操作已发起但在返回前被中断，页面或服务端可能已完成变更。继续前请先调用 snapshot 核对当前状态，勿重复写入。',
+                },
+                modelContent: JSON.stringify({
+                  interrupted: true,
+                  status: 'dispatched_unverified',
+                  error: '操作已发起但在返回前被中断，页面或服务端可能已完成变更。继续前请先调用 snapshot 核对当前状态，勿重复写入。',
+                }),
+              }
+            : errorResult('调用被中断，未执行。');
+          onEvent({ type: 'tool-result', slot, name, input, result: abortedResult });
+          convo.push({ role: 'tool', tool_call_id: call.id, content: abortedResult.modelContent });
+          commit();
           return interrupt('');
         }
       }

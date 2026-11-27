@@ -11,6 +11,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConfigValidationError } from '@/lib/config/errors';
 import { checkNativeFetchCompatibility } from '@/ui/data/local-fetch';
+import type { StoredSubscriptionInfo } from '@/lib/repos/subscriptionsRepo';
+import { SubscriptionSchema } from '@/schemas';
 import type { Collection, Profile, Subscription, SubscriptionFetchHealth } from '@/schemas';
 
 const healthRepo = vi.hoisted(() => {
@@ -35,6 +37,12 @@ const consumerRepos = vi.hoisted(() => ({
 
 const subscriptionFetcher = vi.hoisted(() => ({
   resolveSubscriptionContentRaw: vi.fn(),
+}));
+const fetchCacheRepo = vi.hoisted(() => ({
+  getFetchCache: vi.fn(async () => null as unknown),
+}));
+const manualSnapshot = vi.hoisted(() => ({
+  readVerifiedSubscriptionManualSnapshot: vi.fn<(sub: Subscription) => Promise<string>>(),
 }));
 
 const repo = vi.hoisted(() => ({
@@ -84,7 +92,12 @@ const gate = vi.hoisted(() => ({
 
 vi.mock('@/lib/repos/subscriptionsRepo', () => ({
   ...repo,
-  listSubscriptionSummaries: repo.listSubscriptions,
+  listSubscriptionSummaries: async (readStoredInfo?: (sub: Subscription) => Promise<StoredSubscriptionInfo | undefined>) =>
+    Promise.all((await repo.listSubscriptions()).map(async (sub) => {
+      const summary = { ...sub, storedInfo: await readStoredInfo?.(sub) };
+      delete summary.content;
+      return summary;
+    })),
 }));
 vi.mock('@/lib/repos/profilesRepo', () => ({ listProfiles: consumerRepos.listProfiles }));
 vi.mock('@/lib/repos/collectionsRepo', () => ({
@@ -101,6 +114,14 @@ vi.mock('@/lib/services/nodeOrdinalService', () => ({
   })),
 }));
 vi.mock('@/lib/services/configPreflight', () => gate);
+vi.mock('@/lib/repos/fetchCacheRepo', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/repos/fetchCacheRepo')>()),
+  getFetchCache: fetchCacheRepo.getFetchCache,
+}));
+vi.mock('@/lib/repos/subscriptionManualSnapshotRepo', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/repos/subscriptionManualSnapshotRepo')>()),
+  ...manualSnapshot,
+}));
 vi.mock('@/lib/services/subscriptionFetcher', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
@@ -141,6 +162,7 @@ import {
 } from '@/app/api/v1/subscriptions/[id]/route';
 import { POST as manualRefreshPOST } from '@/app/api/v1/subscriptions/[id]/manual-refresh/route';
 import { GET as localFetchSpecGET } from '@/app/api/v1/subscriptions/[id]/local-fetch-spec/route';
+import { ManualSnapshotIntegrityError } from '@/lib/repos/subscriptionManualSnapshotRepo';
 import type { SubscriptionAdminView, SubscriptionLocalFetchSpec } from '@/schemas';
 
 const REMOTE_ID = '11111111-1111-4111-8111-111111111111';
@@ -203,6 +225,8 @@ beforeEach(() => {
   repo.commitSubscriptionChange.mockResolvedValue({ ok: true, currentVersion: 1 });
   consumerRepos.listProfiles.mockResolvedValue([]);
   consumerRepos.listCollections.mockResolvedValue([]);
+  manualSnapshot.readVerifiedSubscriptionManualSnapshot.mockRejectedValue(new ManualSnapshotIntegrityError('snapshot-missing'));
+  fetchCacheRepo.getFetchCache.mockResolvedValue(null);
   subscriptionFetcher.resolveSubscriptionContentRaw.mockResolvedValue({
     yaml: 'proxies:\n  - { name: fresh, type: direct }\n',
     proxyCount: 1,
@@ -263,6 +287,103 @@ describe('GET /api/v1/subscriptions — admin view projection', () => {
     } as never);
     const { data } = (await json(res)) as { data: SubscriptionAdminView };
     expect(data.fetch_failure_policy).toBe('fail-closed');
+  });
+
+  it('shows traffic from local content and persists the keep switch without editing that content', async () => {
+    const source = localSub({ content: `${localSub().content}  - { name: '到期时间：2027-06-24', type: direct }
+  - { name: '剩余流量：10GB', type: direct }
+` });
+    repo.getSubscription.mockResolvedValue(source);
+    const ctx = { params: Promise.resolve({ id: LOCAL_ID }) } as never;
+    const detail = await itemGET(new Request('https://pm.test/x'), ctx);
+    expect(detail.status).toBe(200);
+    expect(await json(detail)).toMatchObject({
+      data: { traffic: { remaining: 10 * 1024 ** 3, expire: Date.UTC(2027, 5, 24) / 1000 } },
+    });
+    expect(healthRepo.getSubscriptionFetchHealth).not.toHaveBeenCalled();
+
+    const patch = await itemPATCH(new Request('https://pm.test/x', {
+      method: 'PATCH',
+      body: JSON.stringify({ keep_info_nodes: true }),
+    }), ctx);
+    expect(patch.status).toBe(200);
+    expect(await json(patch)).toMatchObject({ data: { keep_info_nodes: true } });
+    expect(SubscriptionSchema.parse(repo.commitSubscriptionChange.mock.calls[0]?.[0])).toMatchObject({
+      keep_info_nodes: true,
+      content: source.content,
+    });
+  });
+
+  it('derives legacy manual traffic and the filtered count from the verified snapshot without rewriting it', async () => {
+    const sub = remoteSub({
+      refresh_mode: 'manual',
+      manual_snapshot_meta: {
+        updated_at: 1,
+        proxy_count: 3,
+        origin: 'web',
+        fetch_identity_revision: 0,
+        content_sha256: 'a'.repeat(64),
+      },
+    });
+    repo.getSubscription.mockResolvedValue(sub);
+    manualSnapshot.readVerifiedSubscriptionManualSnapshot.mockResolvedValue(`proxies:
+  - { name: 'HK', type: direct }
+  - { name: '当前流量：1G / 5G', type: direct }
+  - { name: '到期时间：2027-06-24', type: direct }
+`);
+    const detail = await itemGET(new Request('https://pm.test/x'), {
+      params: Promise.resolve({ id: REMOTE_ID }),
+    } as never);
+    expect(detail.status).toBe(200);
+    expect(await json(detail)).toMatchObject({
+      data: { manual_snapshot: { proxy_count: 1, traffic: {
+        download: 1024 ** 3,
+        total: 5 * 1024 ** 3,
+        expire: Date.UTC(2027, 5, 24) / 1000,
+      } } },
+    });
+    expect(manualSnapshot.readVerifiedSubscriptionManualSnapshot).toHaveBeenCalledWith(sub);
+    expect(healthRepo.getSubscriptionFetchHealth).not.toHaveBeenCalled();
+    expect(repo.commitSubscriptionChange).not.toHaveBeenCalled();
+  });
+
+  it('includes local and legacy manual traffic in the list without exposing subscription bodies', async () => {
+    const content = `proxies:
+  - { name: 'HK', type: trojan, server: hk.example, port: 443, password: 'private-body-sentinel' }
+  - { name: '当前流量：1.91G / 500G', type: direct }
+  - { name: '到期时间：2027-06-24', type: direct }
+`;
+    const manual = remoteSub({
+      refresh_mode: 'manual',
+      manual_snapshot_meta: {
+        updated_at: 1,
+        proxy_count: 3,
+        origin: 'web',
+        fetch_identity_revision: 0,
+        content_sha256: 'a'.repeat(64),
+      },
+    });
+    repo.listSubscriptions.mockResolvedValue([localSub({ content }), manual]);
+    manualSnapshot.readVerifiedSubscriptionManualSnapshot.mockResolvedValue(content);
+
+    const result = await listGET();
+    expect(result.status).toBe(200);
+    const { data } = (await json(result)) as { data: SubscriptionAdminView[] };
+    const traffic = {
+      upload: 0,
+      download: Math.round(1.91 * 1024 ** 3),
+      total: 500 * 1024 ** 3,
+      expire: Date.UTC(2027, 5, 24) / 1000,
+    };
+    expect(data).toMatchObject([
+      { id: LOCAL_ID, traffic },
+      { id: REMOTE_ID, manual_snapshot: { proxy_count: 1, traffic } },
+    ]);
+    expect(data[0]).not.toHaveProperty('content');
+    expect(data[0]).not.toHaveProperty('storedInfo');
+    expect(data[1]).not.toHaveProperty('storedInfo');
+    expect(JSON.stringify(data)).not.toContain('private-body-sentinel');
+    expect(healthRepo.getSubscriptionFetchHealthMany).not.toHaveBeenCalled();
   });
 });
 
@@ -660,6 +781,124 @@ describe('fetch identity revision and mutation timestamps', () => {
     } finally {
       clock.mockRestore();
     }
+  });
+});
+
+describe('server-manual refresh mode transitions', () => {
+  it('creates a remote subscription in server-manual mode without consulting fetch health', async () => {
+    const res = await createPOST(
+      new Request('https://pm.test/api/v1/subscriptions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'mitce',
+          display_name: 'Mitce',
+          kind: 'remote',
+          url: 'https://mitce.example/sub',
+          refresh_mode: 'server-manual',
+        }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const { data } = (await json(res)) as { data: SubscriptionAdminView };
+    expect(data.refresh_mode).toBe('server-manual');
+    expect(data.fetch_health).toBeNull();
+    expect(data.manual_snapshot).toBeNull();
+    expect(healthRepo.getSubscriptionFetchHealth).not.toHaveBeenCalled();
+  });
+
+  it('rejects refresh_mode on local subscription create with 422', async () => {
+    const res = await createPOST(
+      new Request('https://pm.test/api/v1/subscriptions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'local-x',
+          kind: 'local',
+          content: 'proxies:\n  - { name: HK, type: direct }\n',
+          refresh_mode: 'server-manual',
+        }),
+      }),
+    );
+    expect(res.status).toBe(422);
+  });
+
+  it('promotes a valid retained fetch cache into a permanent snapshot when switching server-auto to server-manual without contacting upstream', async () => {
+    const cachedYaml = 'proxies:\n  - { name: Mitce-HK, type: direct }\n';
+    const traffic = { upload: 10, download: 20, total: 100, expire: 1_900_000_000 };
+    fetchCacheRepo.getFetchCache.mockResolvedValue({
+      content: cachedYaml,
+      proxy_count: 1,
+      fetched_at: 1_700_000_000_000,
+      traffic,
+    });
+
+    const res = await itemPATCH(
+      new Request(`https://pm.test/api/v1/subscriptions/${REMOTE_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_mode: 'server-manual' }),
+      }),
+      { params: Promise.resolve({ id: REMOTE_ID }) } as never,
+    );
+    expect(res.status).toBe(200);
+    expect(subscriptionFetcher.resolveSubscriptionContentRaw).not.toHaveBeenCalled();
+    expect(healthRepo.getSubscriptionFetchHealth).not.toHaveBeenCalled();
+
+    const { data } = (await json(res)) as { data: SubscriptionAdminView };
+    expect(data.refresh_mode).toBe('server-manual');
+    expect(data.fetch_health).toBeNull();
+    expect(data.manual_snapshot).toMatchObject({
+      origin: 'server',
+      proxy_count: 1,
+      source_changed: false,
+      traffic,
+    });
+    expect(repo.commitSubscriptionChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: REMOTE_ID,
+        refresh_mode: 'server-manual',
+        manual_snapshot_meta: expect.objectContaining({
+          origin: 'server',
+          proxy_count: 1,
+          updated_at: 1_700_000_000,
+        }),
+      }),
+      7,
+      expect.anything(),
+      expect.objectContaining({
+        manualSnapshot: { type: 'set', content: cachedYaml },
+        clearFetchHealth: true,
+      }),
+    );
+  });
+
+  it('switches server-auto to server-manual without upstream fetch even when no fetch cache exists', async () => {
+    const res = await itemPATCH(
+      new Request(`https://pm.test/api/v1/subscriptions/${REMOTE_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_mode: 'server-manual' }),
+      }),
+      { params: Promise.resolve({ id: REMOTE_ID }) } as never,
+    );
+    expect(res.status).toBe(200);
+    expect(subscriptionFetcher.resolveSubscriptionContentRaw).not.toHaveBeenCalled();
+    const { data } = (await json(res)) as { data: SubscriptionAdminView };
+    expect(data.refresh_mode).toBe('server-manual');
+    expect(data.manual_snapshot).toBeNull();
+    expect(repo.commitSubscriptionChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: REMOTE_ID,
+        refresh_mode: 'server-manual',
+      }),
+      7,
+      expect.anything(),
+      expect.objectContaining({
+        manualSnapshot: { type: 'keep' },
+        clearFetchHealth: true,
+      }),
+    );
   });
 });
 

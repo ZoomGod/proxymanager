@@ -28,7 +28,7 @@ import {
   SubscriptionResolutionValidationError,
 } from '@/lib/services/subscriptionResolutionErrors';
 import { resolveSubscriptionProxies } from '@/lib/services/subscriptionFetcher';
-import type { FetchSubscriptionProxiesResult } from '@/lib/services/subscriptionFetcher';
+import type { FetchSubscriptionProxiesResult, SubscriptionRawSnapshot } from '@/lib/services/subscriptionFetcher';
 import { safeJsonStringify } from '@/lib/security/safeJson';
 import type {
   Collection,
@@ -157,7 +157,9 @@ const SNAPSHOT_READ_ATTEMPTS = 3;
 /** Operation-local, never persisted and never logged (keys are hashed). */
 export type SubscriptionPreflightSnapshot = Map<string, Promise<FetchSubscriptionProxiesResult>>;
 
-function subscriptionSnapshotKey(subscription: Subscription): string {
+const rawSnapshots = new WeakMap<SubscriptionPreflightSnapshot, SubscriptionRawSnapshot>();
+
+function subscriptionSnapshotKey(subscription: Subscription, raw = false): string {
   // Runtime sync/error fields and raw snapshot bytes do not belong here. The
   // bounded definition metadata/checksum identifies manual candidates without
   // copying secret content into the memoization key.
@@ -177,8 +179,9 @@ function subscriptionSnapshotKey(subscription: Subscription): string {
     ttl_ms: subscription.ttl_ms,
     content: subscription.content,
     tags: subscription.tags,
-    operators: subscription.operators,
+    operators: raw ? undefined : subscription.operators,
     fetch_failure_policy: subscription.fetch_failure_policy,
+    keep_info_nodes: subscription.keep_info_nodes === true,
     refresh_mode: subscription.refresh_mode,
     fetch_identity_revision: subscription.fetch_identity_revision,
     manual_snapshot_meta: subscription.manual_snapshot_meta,
@@ -193,20 +196,25 @@ export async function resolveSubscriptionForPreflight(
     ordinalPlanningSession?: OrdinalPlanningSession;
     subscriptionSnapshot?: SubscriptionPreflightSnapshot;
     contentOverrides?: ReadonlyMap<string, string>;
+    managedCollection?: boolean;
   },
 ): Promise<FetchSubscriptionProxiesResult> {
   try {
+    const snapshot = options?.subscriptionSnapshot;
+    const definitionKey = subscriptionSnapshotKey(subscription);
+    if (snapshot && !rawSnapshots.has(snapshot)) rawSnapshots.set(snapshot, new Map());
     const resolve = () =>
       resolveSubscriptionProxies(subscription, {
         writeCache: false,
         recordHealth: false,
         ordinalPlanningSession: options?.ordinalPlanningSession,
         contentOverrides: options?.contentOverrides,
+        managedCollection: options?.managedCollection,
+        ...(snapshot ? { rawSnapshot: { key: subscriptionSnapshotKey(subscription, true), entries: rawSnapshots.get(snapshot)! } } : {}),
       });
-    const snapshot = options?.subscriptionSnapshot;
     if (!snapshot) return await resolve();
 
-    const key = subscriptionSnapshotKey(subscription);
+    const key = `${definitionKey}:${options?.managedCollection === true}`;
     let pending = snapshot.get(key);
     if (!pending) {
       pending = resolve();
@@ -338,6 +346,7 @@ export async function preflightProfileConfig(
         // writes any serving state.
         subscriptionResolver: (subscription, resolverOptions) =>
           resolveSubscriptionForPreflight(subscription, {
+            managedCollection: resolverOptions?.managedCollection,
             ...(resolverOptions?.ordinalPlanningSession || ordinalPlanningSession
               ? {
                   ordinalPlanningSession:

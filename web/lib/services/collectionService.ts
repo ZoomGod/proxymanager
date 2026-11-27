@@ -57,16 +57,15 @@ function invalidateSnapshot(): void {
 
 export async function createCollection(input: CollectionCreate): Promise<Collection> {
   const parsed = CollectionCreateSchema.parse(input);
-  // pass-8 blocker 2: creating a rename-template row through a GENERIC
-  // create is naming-row creation — the mutation policy's dedicated gate.
-  let operators: unknown[] | undefined;
-  if (parsed.operators !== undefined) {
-    operators = applyOperatorMutation(
-      buildOperatorSnapshot({ operators: [] }),
-      parsed.operators,
-      'generic',
-    ).storage;
-  }
+  // 智能命名 is opt-in: a new collection starts with NO rename-template —
+  // users enable it per aggregate from the naming workspace. Creating a
+  // rename-template row through this GENERIC create is still forbidden
+  // (the mutation policy's dedicated naming gate).
+  const operators = applyOperatorMutation(
+    buildOperatorSnapshot({ operators: [] }),
+    parsed.operators,
+    'generic',
+  ).storage;
   // Version bracket FIRST — dup checks + commit share one generation.
   const planningVersion = await getConfigVersion();
   const dup = await getCollectionByName(parsed.name);
@@ -81,7 +80,7 @@ export async function createCollection(input: CollectionCreate): Promise<Collect
   const col: Collection = {
     id: crypto.randomUUID(),
     ...parsed,
-    ...(operators !== undefined ? { operators: operators as Collection['operators'] } : {}),
+    operators: operators as Collection['operators'],
     created_at: now,
     updated_at: now,
   };

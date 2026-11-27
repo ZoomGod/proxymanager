@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installTestHandleSecret } from '../helpers/handleSecret';
 import { buildProfileScope, buildSourceAliasScope } from '@/lib/proxies/handleScopes';
 import { GLOBAL_NAMING_SCOPE_ID } from '@/lib/services/namingTargetScope';
+import { nodeFingerprint } from '@/lib/proxies/naming';
 
 /** Test-local handle helpers over complete one-identity domains. */
 const profileHandle = (profileId: string): string =>
@@ -177,6 +178,14 @@ vi.mock('@/lib/services/configPreflight', () => ({
     configVersion: counters.get(REDIS_KEYS.configVersion) ?? 0,
   })),
 }));
+vi.mock('@/lib/services/namingCandidateService', () => ({
+  loadNamingCandidateContext: vi.fn(async () => ({ recommend: async () => [], grouping: async (purposes?: string[]) => ({
+    configVersion: 0, template: '${region} ${index}', purposes: [{ id: 'region', label: '地区', count: 1, selected: purposes?.includes('region') ?? true }],
+    profiles: [{ name: 'Profile', groups: [{ name: '🇭🇰 香港', kind: 'filter', type: 'select', filter: '香港', count: 1, sample: ['香港 01'] }] }], warnings: [], blocked: false,
+  }) })),
+  publicNamingCandidate: (candidate: unknown) => candidate,
+  publicGroupingPreview: (preview: unknown) => preview,
+}));
 vi.mock('@/lib/services/subscriptionFetcher', () => ({
   resolveSubscriptionProxiesRaw: vi.fn(async () => ({
     proxies: [
@@ -284,7 +293,7 @@ async function call(
   const requestBody =
     body !== null &&
     typeof body === 'object' &&
-    (Object.hasOwn(body, 'apply') || Object.hasOwn(body, 'rollback')) &&
+    (Object.hasOwn(body, 'apply') || Object.hasOwn(body, 'rollback') || Object.hasOwn(body, 'disable')) &&
     !Object.hasOwn(body, 'expectedVersion')
       ? {
           ...(body as Record<string, unknown>),
@@ -301,6 +310,71 @@ async function call(
 }
 
 describe('GET /api/v1/naming/[type]/[id]', () => {
+  it('counts filtered information nodes in workspace diagnostics and live preview', async () => {
+    const { resolveSubscriptionProxiesRaw } = await import('@/lib/services/subscriptionFetcher');
+    const proxies = ['剩余流量：88 GB', '到期时间：2027-01-01', '香港 01'].map((name, i) => ({ name, type: 'ss', server: 'edge.example', port: 440 + i }));
+    vi.mocked(resolveSubscriptionProxiesRaw).mockResolvedValueOnce({ proxies, proxyCount: 3 });
+    const workspace = await call(GET, 'subscription', SUB_ID);
+    expect(workspace.status).toBe(200);
+    expect((await workspace.json()).data.diagnostics).toMatchObject({ nodeCount: 3, infoFiltered: 2 });
+    vi.mocked(resolveSubscriptionProxiesRaw).mockResolvedValueOnce({ proxies, proxyCount: 3 });
+    const preview = await call(POST, 'subscription', SUB_ID, { preview: { template: '${region} ${index}' } });
+    expect(preview.status).toBe(200);
+    expect((await preview.json()).data).toMatchObject({ infoFiltered: 2, after: { count: 1 } });
+  });
+  it('returns read-only policy candidates and rejects stale analysis versions', async () => {
+    seedSub();
+    const before = JSON.stringify([...stores].map(([key, entries]) => [key, [...entries]]));
+    const version = counters.get(REDIS_KEYS.configVersion) ?? 0;
+    const result = await call(POST, 'subscription', SUB_ID, { candidates: true, expectedVersion: version });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ data: { configVersion: version, candidates: [] } });
+    expect(JSON.stringify([...stores].map(([key, entries]) => [key, [...entries]]))).toBe(before);
+    const stale = await call(POST, 'subscription', SUB_ID, { candidates: true, expectedVersion: version + 1 });
+    expect(stale.status).toBe(412);
+  });
+
+  it('previews grouping purposes without writes, validates purpose choices and rejects stale versions', async () => {
+    seedSub();
+    const version = counters.get(REDIS_KEYS.configVersion) ?? 0;
+    const before = JSON.stringify([...stores].map(([key, entries]) => [key, [...entries]]));
+    const response = await call(POST, 'subscription', SUB_ID, { grouping: {}, expectedVersion: version });
+    expect(response.status).toBe(200);
+    expect((await response.json()).data.purposes[0]).toMatchObject({ id: 'region', count: 1, selected: true });
+    const empty = await call(POST, 'subscription', SUB_ID, { grouping: { purposes: [] }, expectedVersion: version });
+    expect(empty.status).toBe(200);
+    expect((await empty.json()).data.purposes[0].selected).toBe(false);
+    for (const purposes of [['unknown'], ['region', 'region']]) {
+      expect((await call(POST, 'subscription', SUB_ID, { grouping: { purposes }, expectedVersion: version })).status).toBe(422);
+    }
+    expect((await call(POST, 'subscription', SUB_ID, { grouping: {}, expectedVersion: version + 1 })).status).toBe(412);
+    expect(JSON.stringify([...stores].map(([key, entries]) => [key, [...entries]]))).toBe(before);
+  });
+
+  it('forwards selected purposes to the audited naming apply path', async () => {
+    seedSub();
+    const namingApply = await import('@/lib/services/namingApplyService');
+    const apply = vi.spyOn(namingApply, 'applyNamingPlan').mockResolvedValueOnce({ planningVersion: 0, confirmedVersion: 0, history: 'created', mode: 'added', label: 'Airport' });
+    try {
+      const version = counters.get(REDIS_KEYS.configVersion) ?? 0;
+      const response = await call(POST, 'subscription', SUB_ID, { apply: { template: '${region} ${index}', groupingPurposes: ['region', 'low-rate'] }, expectedVersion: version });
+      expect(response.status).toBe(200);
+      expect(apply).toHaveBeenCalledWith('subscription', SUB_ID, expect.objectContaining({ groupingPurposes: ['region', 'low-rate'] }), expect.objectContaining({ expectedVersion: version, audit: expect.objectContaining({ scope: 'global' }) }));
+    } finally { apply.mockRestore(); }
+  });
+  it.each(['subscription', 'collection'] as const)('includes saved facts in %s health coverage', async (type) => {
+    const fingerprint = nodeFingerprint({ name: 'old', type: 'ss', server: 'a.example.com', port: 443 })!;
+    const operators = [{ id: 'n', kind: 'rename-template', template: '${vendor} ${tags}', nodeFacts: { [fingerprint]: { vendor: 'Custom', tags: ['IEPL'] } } }];
+    if (type === 'subscription') seedSub({ operators });
+    else bucket(REDIS_KEYS.collections).set(COL_ID, { id: COL_ID, name: 'Pool', subscription_ids: [SUB_ID], tags: [], operators });
+    const res = await call(GET, type, type === 'subscription' ? SUB_ID : COL_ID);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { health: Array<{ nodeFacts: Array<{ field: string; value: string | null; kind: string; confidence: string | null }> }> } };
+    const facts = body.data.health.flatMap((report) => report.nodeFacts);
+    expect(facts).toContainEqual(expect.objectContaining({ field: 'vendor', value: 'Custom', kind: 'ai-rule', confidence: 'high' }));
+    expect(facts).toContainEqual(expect.objectContaining({ field: 'tags', value: 'IEPL', kind: 'ai-rule', confidence: 'high' }));
+  });
+
   it('treats subscriptions and collections as global naming targets, independent of the active profile binding', async () => {
     bucket(REDIS_KEYS.profiles).set(PROFILE_ID, {
       id: PROFILE_ID,
@@ -325,6 +399,25 @@ describe('GET /api/v1/naming/[type]/[id]', () => {
 
     expect(subscription.status).toBe(200);
     expect(collection.status).toBe(200);
+  });
+
+  it('projects generated-group names from persisted Undo history without exposing group records', async () => {
+    bucket(REDIS_KEYS.namingHistory).set('subscription:' + SUB_ID, { hadManaged: false, profileChanges: [{
+      profileId: PROFILE_ID, groups: [], rules: [], createdGroups: [
+        { id: COL_ID, name: '🇯🇵 日本', kind: 'filter', type: 'select', rank: 0, updated_at: 1, 'include-all-proxies': true, filter: '日本' },
+        { id: SUB_ID, name: 'https://private.invalid/secret-value', kind: 'manual', type: 'select', rank: 1, updated_at: 1, proxies: ['DIRECT'] },
+      ],
+    }] });
+    const response = await call(GET, 'subscription', SUB_ID);
+    expect(response.status).toBe(200);
+    const prior = (await response.json()).data.priorPlan;
+    expect(prior.createdGroups).toHaveLength(2);
+    expect(prior.createdGroups[0]).toBe('🇯🇵 日本');
+    expect(typeof prior.createdGroups[1]).toBe('string');
+    expect(JSON.stringify(prior)).not.toContain('private.invalid');
+    expect(prior).not.toHaveProperty('profileChanges');
+    bucket(REDIS_KEYS.namingHistory).set('subscription:' + SUB_ID, { hadManaged: false });
+    expect((await (await call(GET, 'subscription', SUB_ID)).json()).data.priorPlan.createdGroups).toEqual([]);
   });
 
   it('returns managed state, recommended template, health (per-node facts) and diagnostics', async () => {
@@ -480,25 +573,26 @@ describe('GET /api/v1/naming/[type]/[id]', () => {
     expect(badType.status).toBe(422);
   });
 
-  it('diagnostics names are structurally redacted — credential-shaped nodes never echo', async () => {
+  it('admin workspace diagnostics return exact node names without proxy fields', async () => {
+    const name = '香港 [HK-01]';
     const fetcher = await import('@/lib/services/subscriptionFetcher');
     (
       fetcher.resolveSubscriptionProxiesRaw as unknown as ReturnType<typeof vi.fn>
     ).mockResolvedValueOnce({
       proxies: [
         {
-          // a raw name carrying credential-shaped text; its duplicate below
-          // is a TRUE duplicate, so deduped diagnostics echo raw names
-          name: '香港 https://sensitive.example/sub?token=abc123',
+          name,
           type: 'ss',
           server: 'h.example',
           port: 443,
+          password: 'fixture-private-password',
         },
         {
-          name: '香港 https://sensitive.example/sub?token=abc123',
+          name,
           type: 'ss',
           server: 'h.example',
           port: 443,
+          password: 'fixture-private-password',
         },
         { name: '日本 01', type: 'ss', server: 'j.example', port: 443 },
       ],
@@ -515,20 +609,84 @@ describe('GET /api/v1/naming/[type]/[id]', () => {
         };
       };
     };
-    // collisions + deduped ride the same structural redaction
+    expect(body.data.diagnostics.beforeNames).toEqual([name, name, '日本 01']);
     expect(body.data.diagnostics.deduped).toHaveLength(1);
-    expect(body.data.diagnostics.deduped[0].kept).not.toContain('sensitive.example');
-    expect(body.data.diagnostics.deduped[0].dropped).not.toContain('sensitive.example');
+    expect(body.data.diagnostics.deduped[0]).toMatchObject({ kept: name, dropped: name });
     const serialized = JSON.stringify(body.data.diagnostics);
-    expect(serialized).not.toContain('sensitive.example');
-    expect(serialized).not.toContain('token=abc123');
-    // useful bounded semantics survive
+    expect(serialized).not.toContain('h.example');
+    expect(serialized).not.toContain('fixture-private-password');
     expect(serialized).toContain('香港');
     expect(serialized).toContain('日本');
   });
 });
 
 describe('POST apply — policy preservation + persisted prior plan', () => {
+  it('previews, applies and rolls back raw-fingerprint facts through the existing save gate', async () => {
+    const fingerprint = nodeFingerprint({
+      name: 'old',
+      type: 'ss',
+      server: 'a.example.com',
+      port: 443,
+    })!;
+    const oldFacts = { [fingerprint]: { region: 'HK', tags: ['IPLC'] } };
+    const newFacts = { [fingerprint]: { region: 'SG', tags: ['IEPL'], rate: 3 } };
+    seedSub({
+      operators: [
+        { id: 'n', kind: 'rename-template', template: '${region} ${tags}', nodeFacts: oldFacts },
+      ],
+    });
+    const preview = await call(POST, 'subscription', SUB_ID, {
+      preview: { template: '${region} ${tags}', nodeFacts: newFacts },
+    });
+    expect(preview.status).toBe(200);
+    expect(JSON.stringify(await preview.json())).toContain('新加坡 IEPL');
+    expect(bucket(REDIS_KEYS.subscriptions).get(SUB_ID)).toMatchObject({
+      operators: [{ nodeFacts: oldFacts }],
+    });
+    const preflight = (await import('@/lib/services/configPreflight')).preflightProfileConfig;
+    vi.mocked(preflight).mockClear();
+    const applied = await call(POST, 'subscription', SUB_ID, {
+      apply: { template: '${region} ${tags}', nodeFacts: newFacts },
+    });
+    expect(applied.status).toBe(200);
+    expect(preflight).toHaveBeenCalled();
+    expect(bucket(REDIS_KEYS.subscriptions).get(SUB_ID)).toMatchObject({
+      operators: [{ nodeFacts: newFacts }],
+    });
+    expect(await applied.json()).toMatchObject({
+      data: { managed: { nodeFacts: newFacts }, priorPlan: { nodeFacts: oldFacts } },
+    });
+    expect(
+      (await call(POST, 'subscription', SUB_ID, { apply: { template: '${region_code}' } })).status,
+    ).toBe(200);
+    expect(bucket(REDIS_KEYS.subscriptions).get(SUB_ID)).toMatchObject({
+      operators: [{ nodeFacts: newFacts }],
+    });
+    expect(
+      (
+        await call(POST, 'subscription', SUB_ID, {
+          apply: { template: '${region_code}', nodeFacts: {} },
+        })
+      ).status,
+    ).toBe(200);
+    expect(bucket(REDIS_KEYS.subscriptions).get(SUB_ID)).toMatchObject({
+      operators: [{ nodeFacts: {} }],
+    });
+    expect((await call(POST, 'subscription', SUB_ID, { rollback: true })).status).toBe(200);
+    expect(bucket(REDIS_KEYS.subscriptions).get(SUB_ID)).toMatchObject({
+      operators: [{ nodeFacts: newFacts }],
+    });
+  });
+
+  it('rejects invalid node facts without writing', async () => {
+    const before = JSON.stringify(bucket(REDIS_KEYS.subscriptions).get(SUB_ID));
+    const res = await call(POST, 'subscription', SUB_ID, {
+      apply: { template: '${region}', nodeFacts: { aaaaaaaaaaaaaaaa: { tags: ['Unknown'] } } },
+    });
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(bucket(REDIS_KEYS.subscriptions).get(SUB_ID))).toBe(before);
+  });
+
   it('applying ONLY a template preserves the op id, tw2cn, sourceAliases and recognitionRules', async () => {
     const currentOp = {
       id: 'rt-original',
@@ -1276,6 +1434,78 @@ describe('POST apply — policy preservation + persisted prior plan', () => {
       expect(bucket(REDIS_KEYS.namingHistory).has('subscription:' + SUB_ID)).toBe(false);
       void label;
     }
+  });
+
+  it('disable (关闭智能命名) keeps the plan on a disabled row, records an undoable prior state, and rollback re-enables it exactly', async () => {
+    const filler = { id: 'f-1', kind: 'flag-emoji', regions: { HK: '🇭🇰' } };
+    const managedOp = {
+      id: 'rt-on',
+      kind: 'rename-template',
+      template: '${emoji} ${region}',
+      tw2cn: true,
+      recognitionRules: [{ pattern: '中转', field: 'route', value: '中转' }],
+    };
+    seedSub({ operators: [filler, managedOp] });
+    counters.set(REDIS_KEYS.configVersion, 7);
+    const res = await call(POST, 'subscription', SUB_ID, { disable: true });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { managed: { present: boolean }; priorPlan: { present: boolean } } };
+    expect(body.data.priorPlan.present).toBe(true);
+    const stored = bucket(REDIS_KEYS.subscriptions).get(SUB_ID) as { operators: unknown[] };
+    expect(stored.operators).toEqual([filler, { ...managedOp, disabled: true }]);
+    expect(counters.get(REDIS_KEYS.configVersion)).toBe(8);
+    const history = bucket(REDIS_KEYS.namingHistory).get('subscription:' + SUB_ID) as {
+      hadManaged: boolean; opId?: string; position?: number; disabled?: boolean;
+    };
+    expect(history).toMatchObject({ hadManaged: true, opId: 'rt-on', position: 1, disabled: false });
+    const audits = [...bucket(REDIS_KEYS.audit.byId).values()].map((v) => JSON.parse(String(v)) as { op: string; after: { mode: string } });
+    expect(audits.some((a) => a.op === 'naming.apply' && a.after.mode === 'disabled')).toBe(true);
+
+    // disabling again is a clean 422, nothing written
+    const again = await call(POST, 'subscription', SUB_ID, { disable: true });
+    expect(again.status).toBe(422);
+    expect(counters.get(REDIS_KEYS.configVersion)).toBe(8);
+
+    // 撤销 restores the ENABLED row byte-exact
+    const rollbackRes = await call(POST, 'subscription', SUB_ID, { rollback: true });
+    expect(rollbackRes.status).toBe(200);
+    const restored = bucket(REDIS_KEYS.subscriptions).get(SUB_ID) as { operators: unknown[] };
+    expect(restored.operators).toEqual([filler, managedOp]);
+    expect(bucket(REDIS_KEYS.namingHistory).has('subscription:' + SUB_ID)).toBe(false);
+  });
+
+  it('disable without an enabled managed row is a clean 422 with nothing written', async () => {
+    counters.set(REDIS_KEYS.configVersion, 7);
+    const res = await call(POST, 'subscription', SUB_ID, { disable: true });
+    expect(res.status).toBe(422);
+    expect(counters.get(REDIS_KEYS.configVersion)).toBe(7);
+    expect(bucket(REDIS_KEYS.audit.byId).size).toBe(0);
+  });
+
+  it('disable works on collections and re-apply re-enables the kept plan', async () => {
+    bucket(REDIS_KEYS.collections).set(COL_ID, {
+      id: COL_ID,
+      name: '聚合一号',
+      slug: 'agg-1',
+      enabled: true,
+      type: 'select',
+      subscription_ids: [SUB_ID],
+      subscription_tags: [],
+      operators: [],
+      created_at: 1,
+      updated_at: 1,
+    });
+    counters.set(REDIS_KEYS.configVersion, 7);
+    const first = await call(POST, 'collection', COL_ID, { apply: { template: '${region}' } });
+    expect(first.status).toBe(200);
+    const off = await call(POST, 'collection', COL_ID, { disable: true });
+    expect(off.status).toBe(200);
+    const disabled = bucket(REDIS_KEYS.collections).get(COL_ID) as { operators: Array<{ kind: string; disabled?: boolean; template?: string }> };
+    expect(disabled.operators).toEqual([expect.objectContaining({ kind: 'rename-template', template: '${region}', disabled: true })]);
+    const on = await call(POST, 'collection', COL_ID, { apply: { template: '${region}' } });
+    expect(on.status).toBe(200);
+    const enabled = bucket(REDIS_KEYS.collections).get(COL_ID) as { operators: Array<{ disabled?: boolean }> };
+    expect(enabled.operators[0].disabled).toBeUndefined();
   });
 
   it('a pre-existing DISABLED rename-template is preserved as history and restored EXACTLY on rollback', async () => {
@@ -2060,6 +2290,13 @@ describe('pass-11: workspace preview mode + first-use / re-enable apply-through'
       recognitionRules: [],
     },
   };
+
+  it('keeps literal node names in the naming preview', async () => {
+    const res = await call(POST, 'subscription', SUB_ID, { preview: { template: '[${region}]' } });
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.after.names).toContain('[香港]');
+  });
 
   it('preview with absent managed returns the deterministic naming-plan candidate (index 0, added) + zero-write preview', async () => {
     const before = JSON.stringify([...stores.entries()]);

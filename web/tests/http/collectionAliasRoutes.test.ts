@@ -146,6 +146,18 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('pass-10 blocker 1: collection alias routes use the ENABLED authoritative set', () => {
+  it('creates collections WITHOUT naming by default (智能命名 is opt-in)', async () => {
+    for (const [slug, operators] of [['omitted', undefined], ['explicit', []]] as const) {
+      const response = await createPOST(new Request('http://localhost/api/v1/collections', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: slug, slug, operators }),
+      }));
+      expect(response.status).toBe(201);
+      const body = await response.json();
+      expect(body.data.operators).toEqual([]);
+    }
+  });
+
   it('LIST projects only the enabled member — the disabled member alias and its src- handle never appear', async () => {
     const res = await listGET();
     expect(res.status).toBe(200);

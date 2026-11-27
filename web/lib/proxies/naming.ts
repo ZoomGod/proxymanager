@@ -18,7 +18,7 @@
  *   - everything else        literal text, kept verbatim
  *
  * Fields: emoji · region · region_code · entry · route · vendor · source ·
- * protocol · rate · index · note.
+ * protocol · rate · index · note · tags.
  * Modifiers: `${index:N}` (N = 1–4 digit zero-pad width), `${rate:include1x}`
  * (render "1x" too — default omits it), `${protocol:upper}` /
  * `${protocol:lower}` (protocol casing). Any other modifier is rejected.
@@ -43,7 +43,16 @@
  * input order wins) with diagnostic provenance in `deduped`.
  */
 
-import { codeFromFlag, flagFromCode, REGIONS, regionByCode, stripFlags } from './regions';
+import {
+  cnFlagTextRegion,
+  codeFromFlag,
+  flagFromCode,
+  maskDataSizeUnits,
+  REGIONS,
+  regionByCode,
+  stripFlags,
+} from './regions';
+import { isInfoNodeName } from './infoNodes';
 import {
   envelopeOf,
   fingerprintOf,
@@ -67,6 +76,7 @@ export const NAMING_FIELDS = [
   'rate',
   'index',
   'note',
+  'tags',
 ] as const;
 export type NamingField = (typeof NAMING_FIELDS)[number];
 
@@ -81,7 +91,7 @@ export const MAX_RECOGNITION_RULE_VALUE_LENGTH = 24;
 export interface RecognitionRule {
   /** Bounded, safe regex — a validated rule, never arbitrary code. */
   pattern: string;
-  field: 'route' | 'vendor' | 'region' | 'entry';
+  field: 'route' | 'vendor' | 'region' | 'entry' | 'tag';
   /** Bounded replacement fact label. */
   value: string;
 }
@@ -95,6 +105,57 @@ export interface RenameTemplateConfig {
   sourceAliases?: Record<string, string>;
   /** Saved, validated recognition overrides (AI-rule facts). */
   recognitionRules?: RecognitionRule[];
+  nodeFacts?: NodeFacts;
+}
+
+export const LINE_TAGS = ['IEPL', 'IPLC', '专线', 'BGP', '家宽', '原生'] as const;
+export type LineTag = (typeof LINE_TAGS)[number];
+export interface NodeRecognitionFacts {
+  region?: string;
+  tags?: LineTag[];
+  rate?: number;
+  route?: '中转' | '直连' | '落地' | '入口';
+  vendor?: string;
+  info?: boolean;
+}
+export type NodeFacts = Record<string, NodeRecognitionFacts>;
+
+export function effectiveNodeRecognition(
+  proxy: unknown,
+  rules: RecognitionRule[] = [],
+  nodeFacts?: NodeFacts,
+): { rules: RecognitionRule[]; facts: NodeRecognitionFacts | undefined } {
+  const member = envelopeOf(proxy)?.memberNaming;
+  const facts = nodeFacts?.[fingerprintOf(proxy) ?? nodeFingerprint(proxy) ?? ''];
+  return {
+    rules: member?.recognitionRules?.length ? [...rules, ...member.recognitionRules] : rules,
+    facts: member?.facts ? { ...member.facts, ...facts } : facts,
+  };
+}
+
+const TAG_PATTERNS: ReadonlyArray<readonly [LineTag, RegExp]> = [
+  ['IEPL', /\biepl\b/gi],
+  ['IPLC', /\biplc\b/gi],
+  ['专线', /专线|專線/g],
+  ['BGP', /\bbgp\b/gi],
+  ['家宽', /家庭宽带|家庭寬帶|家宽|家寬/g],
+  ['原生', /原生|\bnative\b/gi],
+];
+
+export function canonicalTags(tags: readonly string[]): LineTag[] {
+  return LINE_TAGS.filter((tag) => tags.includes(tag));
+}
+
+function recognizeTags(name: string): { tags: LineTag[]; residual: string } {
+  const tags: LineTag[] = [];
+  let residual = name;
+  for (const [tag, pattern] of TAG_PATTERNS) {
+    if (new RegExp(pattern.source, pattern.flags).test(name)) {
+      tags.push(tag);
+      residual = residual.replace(new RegExp(pattern.source, pattern.flags), ' ');
+    }
+  }
+  return { tags, residual };
 }
 
 /* ─── default templates ────────────────────────────────────────────── */
@@ -194,6 +255,7 @@ const FIELD_MODS: Record<NamingField, ReadonlyArray<string> | null> = {
   rate: ['include1x'],
   index: null, // numeric width handled separately
   note: null,
+  tags: null,
 };
 
 /** Upper bound for the ${index:N} zero-pad width — 1 through 4 digits. */
@@ -400,6 +462,7 @@ export interface RenderContext {
   rate?: string;
   index?: string;
   note?: string;
+  tags?: string;
 }
 
 function present(value: string | undefined | null): value is string {
@@ -479,6 +542,8 @@ function fieldValue(field: NamingField, ctx: RenderContext): string | undefined 
       return ctx.index;
     case 'note':
       return ctx.note;
+    case 'tags':
+      return ctx.tags;
   }
 }
 
@@ -524,6 +589,8 @@ export function withRawIdentity(
 /* ─── recognition ──────────────────────────────────────────────────── */
 
 export interface RecognizedName {
+  info?: boolean;
+  tags: LineTag[];
   /** ISO-ish region code (alpha-2), or null when nothing reliable matched. */
   region: string | null;
   /** Rate multiplier, or null. */
@@ -554,7 +621,9 @@ export interface RecognizedName {
 export type FactConfidence = 'high' | 'medium' | 'low';
 
 /** Bounded rate pattern: 1–3 integer digits, ≤2 fraction digits, x/× suffix. */
-const RATE_RE = /(?:^|[^0-9A-Za-z])(\d{1,3}(?:\.\d{1,2})?)\s*[x×](?![0-9A-Za-z])/;
+const RATE_RE = /(?<![0-9A-Za-z])(\d{1,3}(?:\.\d{1,2})?)\s*[x×](?![0-9A-Za-z])/;
+const EXTRA_RATE_RE =
+  /(?<![0-9A-Za-z.])(?:(\d{1,3}(?:\.\d{1,2})?)\s*倍(?!率)|(?:倍率\s*[:：]?\s*|[x×]\s*)(\d{1,3}(?:\.\d{1,2})?))(?![0-9A-Za-z.])/;
 
 /**
  * Conservative route tokens — entry/transit/exit semantics, bounded + word-
@@ -606,8 +675,10 @@ function firstTokenHit(
 }
 
 /** First region-table pattern hit — same iteration order as detectRegion. */
-function firstRegionHit(text: string): { code: string; start: number; end: number } | null {
+function firstRegionHit(text: string, codes?: readonly string[]): { code: string; start: number; end: number } | null {
+  text = maskDataSizeUnits(text);
   for (const region of REGIONS) {
+    if (codes && !codes.includes(region.code)) continue;
     for (const pattern of region.patterns) {
       const m = pattern.exec(text);
       if (m) return { code: region.code, start: m.index, end: m.index + m[0].length };
@@ -618,6 +689,7 @@ function firstRegionHit(text: string): { code: string; start: number; end: numbe
 
 /** Count DISTINCT region codes hit (flag counts once) — ambiguity signal. */
 function countRegionSignals(text: string, flagCode: string | null): number {
+  text = maskDataSizeUnits(text);
   const codes = new Set<string>();
   if (flagCode) codes.add(flagCode);
   for (const region of REGIONS) {
@@ -671,7 +743,10 @@ function applyRecognitionRules(
   let entry = recognized.entry;
   let vendor = recognized.vendor;
   const confidence = { ...recognized.confidence };
+  let tags = [...recognized.tags];
+  const matched = new Set<RecognitionRule['field']>();
   for (const rule of rules) {
+    if (matched.has(rule.field)) continue;
     let re: RegExp;
     try {
       re = compileRulePattern(rule.pattern);
@@ -682,6 +757,7 @@ function applyRecognitionRules(
     if (!m) continue;
     const value = rule.value.trim();
     if (value === '') continue;
+    matched.add(rule.field);
     switch (rule.field) {
       case 'region':
         region = value.toUpperCase();
@@ -696,17 +772,20 @@ function applyRecognitionRules(
       case 'vendor':
         vendor = value;
         break;
+      case 'tag':
+        tags = canonicalTags([...tags, value]);
+        break;
     }
     // Remove the rule's matched span from the residual so the fact never
     // duplicates itself in the rendered name. The span is matched against
     // the RAW name; replacing it in the residual is literal (never regex).
     const span = name.slice(m.index, m.index + m[0].length);
     if (span !== '') {
-      base = base.replace(span, ' ');
+      if (rule.field !== 'tag') base = base.replace(span, ' ');
     }
     // A SAVED validated rule is authoritative: the overridden field fact is
     // high-confidence (ai-rule provenance is tracked by the health layer).
-    confidence[rule.field] = 'high';
+    confidence[rule.field === 'tag' ? 'tags' : rule.field] = 'high';
   }
   return {
     ...recognized,
@@ -714,6 +793,7 @@ function applyRecognitionRules(
     route,
     entry,
     vendor,
+    tags,
     base: tidyFragment(base),
     confidence,
   };
@@ -724,21 +804,43 @@ function applyRecognitionRules(
  * are extracted; everything else stays in `base` untouched. `rules` are the
  * saved, validated recognition overrides (see {@link RecognitionRule}).
  */
-export function recognizeName(name: string, rules?: RecognitionRule[]): RecognizedName {
+export function recognizeName(
+  name: string,
+  rules?: RecognitionRule[],
+  options?: { detectInfo?: boolean },
+): RecognizedName {
+  if (options?.detectInfo !== false && isInfoNodeName(name)) {
+    return {
+      info: true,
+      tags: [],
+      region: null,
+      rate: null,
+      route: null,
+      entry: null,
+      vendor: null,
+      base: name,
+      regionSignals: 0,
+      routeSignals: 0,
+      confidence: name ? { note: 'high' } : {},
+      ambiguousFields: [],
+    };
+  }
+  const { tags } = recognizeTags(name);
   const flagCode = codeFromFlag(name);
   let base = stripFlags(name);
 
   let region: string | null = flagCode;
-  const hit = firstRegionHit(base);
+  const cnRegion = cnFlagTextRegion(name, flagCode);
+  const hit = (cnRegion ? firstRegionHit(base, [cnRegion.code]) : null) ?? firstRegionHit(base);
   if (hit) {
-    if (region === null) region = hit.code;
+    if (region === null || cnRegion?.code === hit.code) region = hit.code;
     base = `${base.slice(0, hit.start)} ${base.slice(hit.end)}`;
   }
 
   let rate: number | null = null;
-  const rm = RATE_RE.exec(base);
+  const rm = RATE_RE.exec(base) ?? EXTRA_RATE_RE.exec(base);
   if (rm) {
-    rate = Number.parseFloat(rm[1]);
+    rate = Number.parseFloat(rm[1] ?? rm[2]);
     base = `${base.slice(0, rm.index)} ${base.slice(rm.index + rm[0].length)}`;
   }
 
@@ -775,8 +877,10 @@ export function recognizeName(name: string, rules?: RecognitionRule[]): Recogniz
   }
   if (entry !== null) confidence.entry = 'medium';
   if (vendor !== null) confidence.vendor = 'medium';
+  if (tags.length) confidence.tags = 'medium';
   if (base !== '') confidence.note = 'high';
   const recognized: RecognizedName = {
+    tags,
     region,
     rate,
     route,
@@ -807,7 +911,10 @@ export function regionLabelFor(code: string, style: 'zh' | 'code'): string {
 }
 
 export interface FormatNodeOptions {
+  onRecognized?: (facts: NodeRecognitionFacts) => void;
+  facts?: NodeRecognitionFacts;
   name: string;
+  rawName?: string;
   type?: string;
   source?: SourceIdentity | null;
   /** 1-based per-source ordinal (input order). */
@@ -820,6 +927,51 @@ export interface FormatNodeOptions {
 /** Escape a literal for safe use in a RegExp. */
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function applyNodeRecognitionFacts(
+  recognized: RecognizedName,
+  facts: NodeRecognitionFacts | undefined,
+): RecognizedName {
+  if (!facts) return recognized;
+  const result = { ...recognized, confidence: { ...recognized.confidence } };
+  const literals: string[] = [];
+  const fields: NamingField[] = [];
+  if (facts.region !== undefined) {
+    result.region = facts.region;
+    const region = regionByCode(facts.region);
+    literals.push(facts.region, ...(region ? [region.zh, region.alpha3] : []));
+    fields.push('region');
+  }
+  if (facts.tags !== undefined) {
+    result.tags = canonicalTags(facts.tags);
+    fields.push('tags');
+  }
+  if (facts.rate !== undefined) {
+    result.rate = facts.rate;
+    fields.push('rate');
+  }
+  if (facts.route !== undefined) {
+    result.route = facts.route;
+    result.entry = facts.route === '入口' ? '入口' : null;
+    literals.push(facts.route);
+    fields.push('route', 'entry');
+  }
+  if (facts.vendor !== undefined) {
+    result.vendor = facts.vendor;
+    literals.push(facts.vendor);
+    fields.push('vendor');
+  }
+  for (const literal of literals) {
+    if (!literal) continue;
+    const left = /^[A-Za-z0-9]/.test(literal) ? '(?<![A-Za-z0-9])' : '';
+    const right = /[A-Za-z0-9]$/.test(literal) ? '(?![A-Za-z0-9])' : '';
+    result.base = result.base.replace(new RegExp(`${left}${escapeRegExp(literal)}${right}`, 'gi'), ' ');
+  }
+  result.base = tidyFragment(result.base);
+  for (const field of fields) result.confidence[field] = 'high';
+  result.ambiguousFields = result.ambiguousFields.filter((field) => !fields.includes(field));
+  return result;
 }
 
 /** Remove every delimiter-bounded occurrence of `literal` from `text`. */
@@ -853,10 +1005,14 @@ export function templateUsesIndexField(template: string): boolean {
 
 /** Whether the template references the `${source}` field (any depth). */
 function templateUsesSource(tokens: TemplateToken[]): boolean {
-  return tokens.some(
-    (t) =>
-      (t.type === 'field' && t.field === 'source') ||
-      (t.type === 'optional' && t.field === 'source'),
+  return templateUsesField(tokens, 'source');
+}
+
+function templateUsesField(tokens: TemplateToken[], field: NamingField): boolean {
+  return tokens.some((t) =>
+    t.type === 'field'
+      ? t.field === field
+      : t.type === 'optional' && (t.field === field || templateUsesField(t.children, field)),
   );
 }
 
@@ -881,6 +1037,7 @@ export function upstreamOrdinalOf(base: string): number | null {
  */
 export function formatNodeName(opts: FormatNodeOptions): string {
   const { name, config } = opts;
+  if (opts.facts?.info !== false && isInfoNodeName(opts.rawName ?? name)) return name;
   let tokens: TemplateToken[];
   try {
     tokens = compileTemplate(config.template);
@@ -926,19 +1083,38 @@ export function formatNodeName(opts: FormatNodeOptions): string {
   const recognizedBase = recognizeName(
     alias ? stripDelimited(recognitionName, alias) : recognitionName,
     config.recognitionRules,
+    { detectInfo: false },
   );
   const recognizedRaw = alias
-    ? recognizeName(recognitionName, config.recognitionRules)
+    ? recognizeName(recognitionName, config.recognitionRules, { detectInfo: false })
     : recognizedBase;
-  const recognized = { ...recognizedBase, region: recognizedBase.region ?? recognizedRaw.region };
+  const recognized = applyNodeRecognitionFacts(
+    { ...recognizedBase, region: recognizedBase.region === 'CN' && cnFlagTextRegion(recognitionName)
+      ? recognizedRaw.region : recognizedBase.region ?? recognizedRaw.region },
+    opts.facts,
+  );
+  opts.onRecognized?.({ region: recognized.region ?? undefined, tags: [...recognized.tags], rate: recognized.rate ?? undefined,
+    route: recognized.route === '中转' || recognized.route === '直连' || recognized.route === '落地' || recognized.route === '入口' ? recognized.route : undefined,
+    vendor: recognized.vendor ?? undefined });
+  if (templateUsesField(tokens, 'tags')) {
+    recognized.base = recognizeTags(recognized.base).residual;
+    for (const rule of config.recognitionRules ?? []) {
+      if (rule.field !== 'tag') continue;
+      const match = compileRulePattern(rule.pattern).exec(recognitionName);
+      if (!match) continue;
+      recognized.base = recognized.base.replace(match[0], ' ');
+      break;
+    }
+    recognized.base = tidyFragment(recognized.base);
+  }
 
   const ctx: RenderContext = {};
+  ctx.tags = recognized.tags.join(' ');
 
   const flagCode =
-    recognized.region &&
-    (tokens.some((t) => t.type === 'field' && t.field === 'emoji') ||
-      tokens.some((t) => t.type === 'optional' && t.field === 'emoji'))
-      ? config.tw2cn && recognized.region === 'TW'
+    recognized.region && templateUsesField(tokens, 'emoji')
+      ? (config.tw2cn && recognized.region === 'TW') ||
+        (codeFromFlag(recognitionName) === 'CN' && ['TW', 'HK', 'MO'].includes(recognized.region))
         ? 'CN'
         : recognized.region
       : null;
@@ -971,7 +1147,7 @@ export function formatNodeName(opts: FormatNodeOptions): string {
   let upstreamOrdinal: number | null = null;
   if (usesIndex && opts.index !== undefined) {
     upstreamOrdinal = upstreamOrdinalOf(base);
-    if (upstreamOrdinal !== null) {
+    if (/^\d{1,6}$/.test(base)) {
       base = '';
     } else {
       base = base.replace(/[\s\-_·|:：]{1,4}\d{1,3}$/, '').trim();
@@ -1026,6 +1202,7 @@ export interface TrueDedupEntry {
 
 export interface RenameTemplateApplyResult {
   proxies: Record<string, unknown>[];
+  infoFiltered: number;
   /** Nodes whose name changed. */
   changed: number;
   /**
@@ -1138,8 +1315,8 @@ export type OrdinalResolver = (proxy: unknown, sourceKey: string) => number | un
 
 /**
  * Run the rename-template over a proxy list. Deterministic + unique:
- *   - TRUE dedup by node identity (canonical config fingerprint): the first
- *     occurrence per source-priority order wins; dropped nodes are reported
+ *   - TRUE dedup by node identity (canonical config fingerprint): real nodes
+ *     take precedence, then source-priority order; dropped nodes are reported
  *     in `deduped`;
  *   - per-source ordinals resolve in this order: a PERSISTED server-side
  *     assignment (via `ordinalResolver`, monotonic non-reuse), then an
@@ -1156,6 +1333,11 @@ export function applyRenameTemplate(
   sourceOfProxy: (proxy: unknown) => SourceIdentity | undefined = sourceOf,
   ordinalResolver?: OrdinalResolver,
 ): RenameTemplateApplyResult {
+  const effectiveSourceOf = (proxy: unknown) => {
+    const source = sourceOfProxy(proxy);
+    const memberAlias = envelopeOf(proxy)?.memberNaming?.sourceAlias;
+    return source && memberAlias !== undefined ? { ...source, label: memberAlias } : source;
+  };
   // Identity + occurrence for EVERY raw node, computed ONCE (O(n)): both
   // the dedup and collision diagnostics below emit the exact raw-name
   // occurrence at the moment identity is known (C9). The occurrence counts
@@ -1181,22 +1363,36 @@ export function applyRenameTemplate(
     });
   }
 
-  // Pass 0 — true dedup by identity (canonical config fingerprint). First
-  // occurrence wins (input order == source order == the documented
-  // source-priority policy).
+  // Pass 0 — true dedup by identity. Prefer real nodes, then source order.
+  let infoFiltered = 0;
+  const eligible = proxies.map((p) => {
+    const envelope = envelopeOf(p);
+    const savedInfo = effectiveNodeRecognition(p, config.recognitionRules, config.nodeFacts).facts?.info;
+    const rawName = envelope?.rawName ?? (typeof p.name === 'string' ? p.name : '');
+    if (savedInfo === true || (savedInfo !== false && !envelope?.subscriptionInfo && isInfoNodeName(rawName))) {
+      infoFiltered += 1;
+      return false;
+    }
+    return true;
+  });
   const seenIdentity = new Map<string, number>();
+  const realIdentity = new Map<string, number>();
+  proxies.forEach((p, i) => {
+    const fp = rawIdentityByIndex.get(i)?.fp;
+    if (eligible[i] && !envelopeOf(p)?.subscriptionInfo && fp !== undefined && !realIdentity.has(fp)) {
+      realIdentity.set(fp, i);
+    }
+  });
   const deduped: TrueDedupEntry[] = [];
   const surviving: Array<{ proxy: Record<string, unknown>; index: number }> = [];
   proxies.forEach((p, i) => {
-    // Identity is the IMMUTABLE raw fingerprint carried from the fetch
-    // boundary when present (fallback: compute from the current object — the
-    // documented path for envelope-less test inputs).
-    const fp = fingerprintOf(p) ?? nodeFingerprint(p);
-    if (fp === null) {
+    if (!eligible[i]) return;
+    const fp = rawIdentityByIndex.get(i)?.fp;
+    if (fp === undefined) {
       surviving.push({ proxy: p, index: i });
       return;
     }
-    const first = seenIdentity.get(fp);
+    const first = (envelopeOf(p)?.subscriptionInfo ? realIdentity.get(fp) : undefined) ?? seenIdentity.get(fp);
     if (first === undefined) {
       seenIdentity.set(fp, i);
       surviving.push({ proxy: p, index: i });
@@ -1245,7 +1441,8 @@ export function applyRenameTemplate(
     if (usesIndex) {
       const name = typeof p.name === 'string' ? p.name : '';
       if (name !== '') {
-        const upstream = upstreamOrdinalOf(recognizeName(name, config.recognitionRules).base);
+        const rules = effectiveNodeRecognition(p, config.recognitionRules).rules;
+        const upstream = upstreamOrdinalOf(recognizeName(name, rules).base);
         if (upstream !== null && upstream > 0) ordinal = upstream;
       }
     }
@@ -1262,6 +1459,7 @@ export function applyRenameTemplate(
 
   const candidates: Array<{
     proxy: Record<string, unknown>;
+    facts?: NodeRecognitionFacts;
     name: string;
     formatted: string;
     changed: boolean;
@@ -1270,21 +1468,27 @@ export function applyRenameTemplate(
   for (let i = 0; i < list.length; i += 1) {
     const p = list[i];
     const name = typeof p.name === 'string' ? p.name : '';
-    const source = sourceOfProxy(p);
+    const source = effectiveSourceOf(p);
     const key = source?.key ?? '';
 
+    const recognition = effectiveNodeRecognition(p, config.recognitionRules, config.nodeFacts);
+    let facts: NodeRecognitionFacts | undefined;
+
     const formatted =
-      name === ''
-        ? ''
+      name === '' || envelopeOf(p)?.subscriptionInfo
+        ? name
         : formatNodeName({
             name,
+            rawName: envelopeOf(p)?.rawName,
             type: typeof p.type === 'string' ? p.type : undefined,
             source: source ?? null,
             index: ordinals.get(i),
             indexWidth: Math.max(2, widthBySource.get(key) ?? 2),
-            config,
+            config: { ...config, recognitionRules: recognition.rules },
+            facts: recognition.facts,
+            onRecognized: (recognized) => { facts = recognized; },
           });
-    candidates.push({ proxy: p, name, formatted, changed: name !== '' && formatted !== name });
+    candidates.push({ proxy: p, facts, name, formatted, changed: name !== '' && formatted !== name });
   }
 
   // Deterministic uniqueness contract: the FINAL output has NO duplicate
@@ -1324,7 +1528,7 @@ export function applyRenameTemplate(
   for (let i = 0; i < candidates.length; i += 1) {
     const c = candidates[i];
     if (c.name === '' || firstUnchanged.has(i)) continue;
-    const source = sourceOfProxy(c.proxy);
+    const source = effectiveSourceOf(c.proxy);
     const sourceKey = source?.key;
     const sourceLabel = sourceKey
       ? (config.sourceAliases?.[sourceKey] ?? source?.label ?? null)
@@ -1393,10 +1597,36 @@ export function applyRenameTemplate(
   }
 
   const out: Record<string, unknown>[] = candidates.map((c, i) => {
-    if (c.name === '' || firstUnchanged.has(i)) return c.proxy;
-    return { ...c.proxy, name: finals.get(i)! };
+    const proxy = c.name === '' || firstUnchanged.has(i) ? c.proxy : { ...c.proxy, name: finals.get(i)! };
+    const source = effectiveSourceOf(c.proxy);
+    return c.facts ? mergeEnvelope(proxy, { renderedNaming: { facts: c.facts, template: config.template, tw2cn: config.tw2cn,
+      sourceLabel: (config.sourceAliases?.[source?.key ?? ''] ?? source?.label)?.trim() } }) : proxy;
   });
-  return { proxies: out, changed, collisions, collisionNodes, deduped };
+  const finalByIdentity = new Map<string | null, unknown>();
+  const identityCounts = new Map<string | null, number>();
+  for (const proxy of proxies) {
+    const identity = fingerprintOf(proxy) ?? nodeFingerprint(proxy);
+    identityCounts.set(identity, (identityCounts.get(identity) ?? 0) + 1);
+  }
+  for (const proxy of out) {
+    const identity = fingerprintOf(proxy) ?? nodeFingerprint(proxy);
+    if (identity !== null && identityCounts.get(identity) === 1) finalByIdentity.set(identity, proxy.name);
+  }
+  const targetsByName = new Map<string, Set<unknown>>();
+  for (const proxy of proxies) {
+    if (typeof proxy.name !== 'string') continue;
+    const targets = targetsByName.get(proxy.name) ?? new Set();
+    targets.add(finalByIdentity.get(fingerprintOf(proxy) ?? nodeFingerprint(proxy)));
+    targetsByName.set(proxy.name, targets);
+  }
+  const referenced = out.map((proxy) => {
+    const target = proxy['dialer-proxy'];
+    if (typeof target !== 'string') return proxy;
+    const names = targetsByName.get(target);
+    const next = names?.size === 1 ? [...names][0] : undefined;
+    return typeof next === 'string' && next !== target ? { ...proxy, 'dialer-proxy': next } : proxy;
+  });
+  return { proxies: referenced, infoFiltered, changed, collisions, collisionNodes, deduped };
 }
 
 function compileTemplateSafe(template: string): TemplateToken[] {

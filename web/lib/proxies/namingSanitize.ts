@@ -1,4 +1,18 @@
-import { FIXED_MIHOMO_PROXY_TYPES } from './mihomoProxyValidator';
+import { FIXED_MIHOMO_PROXY_TYPES } from './mihomoProxyTypes';
+
+export function maskProxyEndpoint(
+  name: string,
+  proxy: { server?: unknown; port?: unknown },
+): string {
+  const server = typeof proxy.server === 'string' ? proxy.server.trim().replace(/^\[(.*)\]$/, '$1') : '';
+  if (!server) return name;
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const host = escape(server);
+  const hosts = server.includes(':') ? `(?:\\[${host}\\]|${host})` : host;
+  const port = String(proxy.port ?? '');
+  const endpoint = /^\d+$/.test(port) ? `${hosts}(?::${port}(?!\\d))?` : hosts;
+  return name.replace(new RegExp(endpoint, 'gi'), '***');
+}
 
 /**
  * Credential-free AI payload construction for the naming-analysis feature.

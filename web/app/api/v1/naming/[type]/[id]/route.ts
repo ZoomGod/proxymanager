@@ -31,7 +31,12 @@
  */
 
 import { withProblemDetails } from '@/lib/http/handler';
+import { NodeFactsSchema } from '@/schemas/nodeFacts';
+import type { NodeFacts } from '@/lib/proxies/naming';
 import { enabledCollectionMemberSubs } from '@/lib/engine/resolve';
+import { collectionMemberNamingWarnings, type MemberNamingWarning } from '@/lib/proxies/collectionNaming';
+import { loadNamingCandidateContext, publicNamingCandidate, publicGroupingPreview } from '@/lib/services/namingCandidateService';
+import { GROUPING_PURPOSES } from '@/lib/proxies/namingGroupGeneration';
 import {
   projectAliasKeysToHandles,
   resolveSourceAliasKeys,
@@ -72,7 +77,7 @@ import { mergeCollectionMemberProxies } from '@/lib/services/nodeExportService';
 import { resolveSubscriptionProxiesRaw } from '@/lib/services/subscriptionFetcher';
 import { getCollection } from '@/lib/services/collectionService';
 import { getSubscription, listSubscriptions } from '@/lib/services/subscriptionService';
-import { applyNamingPlan, rollbackNamingPlan } from '@/lib/services/namingApplyService';
+import { applyNamingPlan, disableNamingPlan, rollbackNamingPlan } from '@/lib/services/namingApplyService';
 import { listProfiles } from '@/lib/repos/profilesRepo';
 import { getNamingHistory, type NamingHistoryPlan } from '@/lib/repos/namingHistoryRepo';
 import {
@@ -116,6 +121,7 @@ const PlanBody = z
     // stable keys fail at parse with the bounded order-independent error.
     sourceAliases: ExternalSourceAliasesSchema,
     recognitionRules: z.array(RecognitionRuleSchema).max(32, '识别规则最多 32 条').optional(),
+    nodeFacts: NodeFactsSchema.optional(),
   })
   .strict();
 
@@ -125,7 +131,10 @@ const ExpectedVersion = z
   .min(0)
   .max(Number.MAX_SAFE_INTEGER, '配置版本超出安全范围');
 
-const ApplyBody = z.object({ apply: PlanBody, expectedVersion: ExpectedVersion }).strict();
+const GroupingPurposes = z.array(z.enum(GROUPING_PURPOSES)).max(5).refine((values) => new Set(values).size === values.length, '分组用途不能重复');
+const ApplyBody = z.object({ apply: PlanBody.extend({ groupingPurposes: GroupingPurposes.min(1).optional() }), expectedVersion: ExpectedVersion, migrateGroups: z.boolean().optional() }).strict();
+const CandidatesBody = z.object({ candidates: z.literal(true), expectedVersion: ExpectedVersion }).strict();
+const GroupingBody = z.object({ grouping: z.object({ purposes: GroupingPurposes.optional() }).strict(), expectedVersion: ExpectedVersion }).strict();
 
 /**
  * Read-only workspace preview variant: build the SAME managed candidate the
@@ -142,7 +151,15 @@ const RollbackBody = z
   })
   .strict();
 
-const PostBody = z.union([ApplyBody, PreviewBody, RollbackBody]);
+/** 关闭智能命名: mark the managed row disabled (original names), undoable. */
+const DisableBody = z
+  .object({
+    disable: z.literal(true),
+    expectedVersion: ExpectedVersion,
+  })
+  .strict();
+
+const PostBody = z.union([ApplyBody, PreviewBody, RollbackBody, DisableBody, CandidatesBody, GroupingBody]);
 
 /** Project a PERSISTED history plan for the workspace response — explicit
  * fields only (template/tw2cn/sourceAliases/disabled). rawOp, opId, position
@@ -156,11 +173,14 @@ function projectHistoryPlan(
   template?: string;
   tw2cn?: boolean;
   sourceAliases?: Record<string, string>;
+  nodeFacts?: NodeFacts;
   disabled?: boolean;
+  createdGroups?: string[];
 } {
   if (!prior) return { present: false };
   return {
     present: true,
+    createdGroups: (prior.profileChanges ?? []).flatMap((change) => (change.createdGroups ?? []).map((group) => safeIssueText(group.name))),
     // display-only surface: dirty template content (URLs/tokens/credentials)
     // is redacted + bounded before it can leave storage (finding 7). The
     // EDITABLE managed template stays raw — the editor round-trips it.
@@ -168,6 +188,7 @@ function projectHistoryPlan(
       ? { template: redactSensitiveText(prior.template).slice(0, 512) }
       : {}),
     ...(prior.tw2cn !== undefined ? { tw2cn: prior.tw2cn } : {}),
+    ...(prior.nodeFacts !== undefined ? { nodeFacts: prior.nodeFacts } : {}),
     ...(prior.sourceAliases !== undefined
       ? {
           // pass-6 blocker 2: alias KEYS project to opaque src-* handles;
@@ -205,6 +226,7 @@ function planOf(
         tw2cn?: boolean;
         sourceAliases?: Record<string, string>;
         recognitionRules?: unknown[];
+        nodeFacts?: NodeFacts;
         disabled?: boolean;
       }
     | undefined,
@@ -215,6 +237,7 @@ function planOf(
   tw2cn?: boolean;
   sourceAliases?: Record<string, string>;
   recognitionRules?: Operator['kind'] extends never ? never : unknown[];
+  nodeFacts?: NodeFacts;
   disabled?: boolean;
 } {
   if (!op) return { present: false };
@@ -224,6 +247,7 @@ function planOf(
     tw2cn: op.tw2cn === true,
     sourceAliases: projectAliases(op.sourceAliases ?? {}),
     recognitionRules: op.recognitionRules ?? [],
+    ...(op.nodeFacts !== undefined ? { nodeFacts: op.nodeFacts } : {}),
     // activation state: a persisted (aligned) rename-template row that is
     // disabled is still managed history — the workspace shows its stored
     // policy and can apply (re-enable) it without any other edit
@@ -238,11 +262,13 @@ interface WorkspacePayload {
   entity: { type: 'subscription' | 'collection'; ref: string; label: string };
   aggregate: boolean;
   managed: ReturnType<typeof planOf>;
-  priorPlan: ReturnType<typeof planOf>;
+  priorPlan: ReturnType<typeof projectHistoryPlan>;
   recommended: string;
   health: ReturnType<typeof analyzeSourceFacts>;
   diagnostics: {
+    memberWarnings?: MemberNamingWarning[];
     nodeCount: number;
+    infoFiltered: number;
     changed: number;
     collisions: string[];
     deduped: Array<{ kept: string; dropped: string; sourceKey?: string }>;
@@ -316,7 +342,7 @@ async function loadWorkspace(
     // go through ONE collision-checked node scope over the COMPLETE snapshot
     // and ONE source scope over the complete key set (handle minting lives in
     // handleScopes/namingContextProjection, never in the analysis).
-    const reports = analyzeSourceFacts(withProvenance, { rules: previewOp?.recognitionRules });
+    const reports = analyzeSourceFacts(withProvenance, { rules: previewOp?.recognitionRules, nodeFacts: previewOp?.nodeFacts });
     const { scope: nodeScope } = buildNodeSnapshotScope(withProvenance);
     const sourceScope = buildSourceAliasScope(reports.map((r) => r.sourceKey));
     const health = reports.map((report) => ({
@@ -336,6 +362,7 @@ async function loadWorkspace(
         tw2cn: previewOp?.tw2cn,
         sourceAliases: previewOp?.sourceAliases ?? {},
         recognitionRules: previewOp?.recognitionRules ?? [],
+        nodeFacts: previewOp?.nodeFacts,
       },
       sourceOf,
       ordinals,
@@ -368,17 +395,18 @@ async function loadWorkspace(
       health,
       diagnostics: {
         nodeCount: withProvenance.length,
+        infoFiltered: result.infoFiltered,
         changed: result.changed,
-        collisions: result.collisions.map(safeIssueText),
+        collisions: result.collisions,
         deduped: result.deduped.map((d) => ({
-          kept: safeIssueText(d.kept),
-          dropped: safeIssueText(d.dropped),
+          kept: d.kept,
+          dropped: d.dropped,
           // pass-7: stable source keys never leave storage — keyed src
           // handles projected through the complete-domain source scope
           ...(d.sourceKey !== undefined ? { sourceKey: sourceScope.project(d.sourceKey) } : {}),
         })),
-        beforeNames: before.slice(0, 50).map(safeIssueText),
-        afterNames: after.slice(0, 50).map(safeIssueText),
+        beforeNames: before.slice(0, 50),
+        afterNames: after.slice(0, 50),
         truncated: before.length > 50,
       },
       references: {
@@ -410,9 +438,9 @@ async function loadWorkspace(
   const effectiveTemplate = previewOp?.template ?? recommended;
   const subs = await listSubscriptions();
   const { merged, ordinalPlanningSession, ordinalDomainRegistry } =
-    await mergeCollectionMemberProxies(collection, subs, { writeCache: false });
+    await mergeCollectionMemberProxies(collection, subs, { writeCache: false, managedCollection: true });
   // round-1: same complete-domain projection as the subscription branch.
-  const reports = analyzeSourceFacts(merged, { rules: previewOp?.recognitionRules });
+  const reports = analyzeSourceFacts(merged, { rules: previewOp?.recognitionRules, nodeFacts: previewOp?.nodeFacts });
   const { scope: nodeScope } = buildNodeSnapshotScope(merged);
   const sourceScope = buildSourceAliasScope(reports.map((r) => r.sourceKey));
   const health = reports.map((report) => ({
@@ -434,6 +462,7 @@ async function loadWorkspace(
       tw2cn: previewOp?.tw2cn,
       sourceAliases: previewOp?.sourceAliases ?? {},
       recognitionRules: previewOp?.recognitionRules ?? [],
+      nodeFacts: previewOp?.nodeFacts,
     },
     sourceOf,
     ordinals,
@@ -460,15 +489,17 @@ async function loadWorkspace(
     health,
     diagnostics: {
       nodeCount: merged.length,
+      infoFiltered: result.infoFiltered,
+      memberWarnings: collectionMemberNamingWarnings(enabledCollectionMemberSubs(collection, subs), true),
       changed: result.changed,
-      collisions: result.collisions.map(safeIssueText),
+      collisions: result.collisions,
       deduped: result.deduped.map((d) => ({
-        kept: safeIssueText(d.kept),
-        dropped: safeIssueText(d.dropped),
+        kept: d.kept,
+        dropped: d.dropped,
         ...(d.sourceKey !== undefined ? { sourceKey: sourceScope.project(d.sourceKey) } : {}),
       })),
-      beforeNames: before.slice(0, 50).map(safeIssueText),
-      afterNames: after.slice(0, 50).map(safeIssueText),
+      beforeNames: before.slice(0, 50),
+      afterNames: after.slice(0, 50),
       truncated: before.length > 50,
     },
     references: {
@@ -508,6 +539,19 @@ export const POST = withProblemDetails(async (request: Request, ctx: Ctx) => {
     throw ProblemDetailsError.badRequest('Request body must be valid JSON.');
   });
   const body = PostBody.parse(raw);
+  if ('grouping' in body) {
+    await requireGlobalNamingTarget(type, id);
+    if (await getConfigVersion() !== body.expectedVersion) throw ProblemDetailsError.preconditionFailed('配置已修改，请刷新分组预览。');
+    const context = await loadNamingCandidateContext(type, id, body.expectedVersion);
+    return Response.json({ data: publicGroupingPreview(await context.grouping(body.grouping.purposes)) });
+  }
+  if ('candidates' in body) {
+    await requireGlobalNamingTarget(type, id);
+    if (await getConfigVersion() !== body.expectedVersion) throw ProblemDetailsError.preconditionFailed('配置已修改，请刷新推荐方案。');
+    const context = await loadNamingCandidateContext(type, id, body.expectedVersion);
+    return Response.json({ data: { configVersion: body.expectedVersion, candidates: (await context.recommend()).map(publicNamingCandidate),
+      ...(context.hasGrouplessProfiles ? { groupingAvailable: true } : {}) } });
+  }
 
   // READ-ONLY workspace preview variant: same shared candidate builder as
   // apply, same zero-write pipeline preview functions as the generic
@@ -538,6 +582,7 @@ export const POST = withProblemDetails(async (request: Request, ctx: Ctx) => {
           tw2cn: body.preview.tw2cn,
           sourceAliases: stableAliases,
           recognitionRules: body.preview.recognitionRules,
+          nodeFacts: body.preview.nodeFacts,
         },
         priorPolicyOf(managedOp),
       ),
@@ -550,6 +595,7 @@ export const POST = withProblemDetails(async (request: Request, ctx: Ctx) => {
     return Response.json({
       data: {
         after: preview.after,
+        infoFiltered: preview.infoFiltered,
         issues: preview.issues,
         candidate: { id: candidate.id, index: candidate.index, mode: candidate.mode },
       },
@@ -562,6 +608,10 @@ export const POST = withProblemDetails(async (request: Request, ctx: Ctx) => {
   // profile-scoped authority remains exclusive to assistant actions.
   await requireGlobalNamingTarget(type, id);
   const audit = { actor, scope: 'global' as const };
+  if ('disable' in body) {
+    await disableNamingPlan(type, id, { audit, expectedVersion: body.expectedVersion });
+    return Response.json({ data: await loadWorkspace(type, id) });
+  }
   if ('rollback' in body) {
     // Rollback restores the persisted prior plan, clears the history field
     // AND persists a durable naming-source audit event in ONE atomic
@@ -577,6 +627,7 @@ export const POST = withProblemDetails(async (request: Request, ctx: Ctx) => {
   // commits config + version + history HSET + durable audit in ONE atomic
   // transition.
   await applyNamingPlan(type, id, body.apply, {
+    migrateGroups: body.migrateGroups,
     audit,
     expectedVersion: body.expectedVersion,
   });

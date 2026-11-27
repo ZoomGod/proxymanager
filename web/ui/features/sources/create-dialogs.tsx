@@ -2,6 +2,8 @@
 
 import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { Button as UiButton } from '@ui-sdk/react/button';
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from '@ui-sdk/react/collapsible';
 import { ChevronRight, Globe, HardDrive } from 'lucide-react';
 import { api } from '@/ui/data/api';
 import { refreshShared } from '@/ui/data/hooks';
@@ -17,6 +19,7 @@ import {
   MultiCombobox,
   notify,
   SegmentedControl,
+  Switch,
   TagInput,
   Textarea,
 } from '@/ui/primitives';
@@ -61,6 +64,7 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
   const [advanced, setAdvanced] = useState(false);
   const [ua, setUa] = useState('');
   const [rows, setRows] = useState<HeaderRow[]>([]);
+  const [autoRefresh, setAutoRefresh] = useState(true);
   const [ttl, setTtl] = useState(String(DEFAULT_TTL_MINUTES));
   const [policy, setPolicy] = useState<FailurePolicy>('use-stale-cache');
   const [content, setContent] = useState('');
@@ -72,7 +76,7 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
   const errors = {
     url: kind === 'remote' ? validateUrl(url) : null,
     slug: validateSlug(effectiveSlug, taken),
-    ttl: kind === 'remote' ? validateTtl(ttl) : null,
+    ttl: kind === 'remote' && autoRefresh ? validateTtl(ttl) : null,
     content: kind === 'local' && !content.trim() ? '请粘贴节点内容（YAML，包含 proxies: 列表）' : null,
   };
   const headerErrors = kind === 'remote' ? headers.errors : {};
@@ -89,6 +93,7 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
     setAdvanced(false);
     setUa('');
     setRows([]);
+    setAutoRefresh(true);
     setTtl(String(DEFAULT_TTL_MINUTES));
     setPolicy('use-stale-cache');
     setContent('');
@@ -113,6 +118,7 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
             custom_headers: Object.keys(headers.headers).length ? headers.headers : undefined,
             ttl_ms: Number(ttl) * 60_000,
             fetch_failure_policy: policy,
+            refresh_mode: autoRefresh ? 'server-auto' : 'server-manual',
             tags,
             operators: [],
           }
@@ -129,9 +135,16 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
     setSaving(true);
     try {
       const created = await api.post<Source>('/subscriptions', body);
-      notify.success(`已添加「${sourceTitle(created)}」`, kind === 'remote' ? '正在第一次拉取节点…' : undefined);
+      notify.success(
+        `已添加「${sourceTitle(created)}」`,
+        kind === 'remote'
+          ? autoRefresh
+            ? '正在第一次拉取节点…'
+            : '已关闭自动刷新，需要时请手动点击「手动刷新」拉取节点'
+          : undefined,
+      );
       refreshShared();
-      if (created.kind === 'remote') void refreshSource(created, true);
+      if (created.kind === 'remote' && autoRefresh) void refreshSource(created, true);
       reset();
       onOpenChange(false);
       router.push(`/sources/${created.id}`);
@@ -154,8 +167,13 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             取消
           </Button>
-          <Button variant="primary" loading={saving} onClick={() => void submit()}>
-            添加
+          <Button
+            variant="primary"
+            loading={saving}
+            data-agent-confirm={`添加订阅源「${displayName.trim() || effectiveSlug || '新订阅源'}」`}
+            onClick={() => void submit()}
+          >
+            确认添加
           </Button>
         </>
       }
@@ -168,6 +186,7 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
         }}
       >
         <SegmentedControl
+          label="订阅源类型"
           stretch
           value={kind}
           onChange={setKind}
@@ -222,51 +241,65 @@ export function AddSourceDialog({ open, onOpenChange, sources }: { open: boolean
           <Field label="节点内容" error={submitted ? errors.content : null} hint="Clash 格式的 YAML，包含一个 proxies: 列表。">
             {() => (
               <div className={cn('overflow-hidden rounded-md border bg-surface', submitted && errors.content ? 'border-bad' : 'border-line')}>
-                <CodeEditor value={content} onChange={setContent} placeholder={LOCAL_PLACEHOLDER} height="220px" />
+                <CodeEditor label="节点内容" value={content} onChange={setContent} placeholder={LOCAL_PLACEHOLDER} height="220px" />
               </div>
             )}
           </Field>
         )}
         <Field label="标签" optional hint="聚合订阅可以按标签自动收录订阅源。">
-          {() => <TagInput value={tags} onChange={setTags} validate={validateTag} placeholder="例如 airport，回车添加" />}
+          {() => <TagInput aria-label="订阅源标签" value={tags} onChange={setTags} validate={validateTag} placeholder="例如 airport，回车添加" />}
         </Field>
         {kind === 'remote' && (
-          <div className="rounded-xl border border-line">
-            <button
-              type="button"
-              aria-expanded={advanced}
-              onClick={() => setAdvanced((v) => !v)}
-              className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-[13px] font-medium text-ink-2 hover:text-ink"
-            >
+          <Collapsible open={advanced} onOpenChange={(next) => setAdvanced(next)} className="rounded-xl border border-line">
+            <CollapsibleTrigger className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-[13px] font-medium text-ink-2 hover:text-ink">
               <ChevronRight size={14} className={cn('transition-transform', advanced && 'rotate-90')} />
-              高级
-              <span className="text-xs font-normal text-ink-3">User-Agent、请求头、缓存时长、失败策略</span>
-            </button>
-            {advanced && (
-              <div className="flex flex-col gap-4 border-t border-line px-3.5 py-3.5">
-                <Field label="User-Agent" optional hint={`留空使用默认的 ${DEFAULT_UA}。部分机场按它决定返回的格式。`}>
-                  {(id) => <Input id={id} mono value={ua} placeholder={DEFAULT_UA} onChange={(e) => setUa(e.target.value)} />}
-                </Field>
-                <Field label="自定义请求头" optional>
-                  {() => <HeaderRowsEditor rows={rows} onChange={setRows} errors={headerErrors} />}
-                </Field>
-                <Field label="缓存时长" error={show('ttl')} hint="这段时间内重复使用上次拉取的结果，减少对机场的请求。">
-                  {(id) => (
-                    <Input
-                      id={id}
-                      inputMode="numeric"
-                      value={ttl}
-                      invalid={!!show('ttl')}
-                      onChange={(e) => setTtl(e.target.value.replace(/[^\d]/g, ''))}
-                      trailing={<span className="pr-1 text-xs text-ink-3">分钟</span>}
-                      className="w-40"
-                    />
-                  )}
-                </Field>
-                <Field label="拉取失败时">{() => <PolicyPicker value={policy} onChange={setPolicy} />}</Field>
+              高级设置
+              <span data-agent-hidden className="text-xs font-normal text-ink-3">
+                自动刷新、User-Agent、请求头、缓存时长、失败策略
+              </span>
+            </CollapsibleTrigger>
+            <CollapsiblePanel className="flex flex-col gap-4 border-t border-line px-3.5 py-3.5">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-[13px] font-medium text-ink">自动刷新</div>
+                  <p className="mt-0.5 text-xs text-ink-3">
+                    {autoRefresh
+                      ? '缓存过期后自动向上游拉取最新节点，添加后会立即拉取一次。'
+                      : '关闭后绝不自动请求上游链接，永久保留上次手动刷新的缓存（适合仅短时间激活有效的机场订阅）。'}
+                  </p>
+                </div>
+                <Switch
+                  checked={autoRefresh}
+                  onCheckedChange={setAutoRefresh}
+                  label="自动刷新上游订阅"
+                />
               </div>
-            )}
-          </div>
+              <Field label="User-Agent" optional hint={`留空使用默认的 ${DEFAULT_UA}。`}>
+                {(id) => <Input id={id} mono value={ua} placeholder={DEFAULT_UA} onChange={(e) => setUa(e.target.value)} />}
+              </Field>
+              <Field label="自定义请求头" optional>
+                {() => <HeaderRowsEditor rows={rows} onChange={setRows} errors={headerErrors} />}
+              </Field>
+              {autoRefresh && (
+                <>
+                  <Field label="缓存时长" error={show('ttl')} hint="这段时间内重复使用上次拉取的结果，减少对机场的请求。">
+                    {(id) => (
+                      <Input
+                        id={id}
+                        inputMode="numeric"
+                        value={ttl}
+                        invalid={!!show('ttl')}
+                        onChange={(e) => setTtl(e.target.value.replace(/[^\d]/g, ''))}
+                        trailing={<span className="pr-1 text-xs text-ink-3">分钟</span>}
+                        className="w-40"
+                      />
+                    )}
+                  </Field>
+                  <Field label="拉取失败时">{() => <PolicyPicker value={policy} onChange={setPolicy} />}</Field>
+                </>
+              )}
+            </CollapsiblePanel>
+          </Collapsible>
         )}
         <button type="submit" hidden />
       </form>
@@ -358,8 +391,13 @@ export function NewPoolDialog({
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             取消
           </Button>
-          <Button variant="primary" loading={saving} onClick={() => void submit()}>
-            创建
+          <Button
+            variant="primary"
+            loading={saving}
+            data-agent-confirm={`新建聚合订阅「${name.trim() || effectiveSlug || '新聚合订阅'}」`}
+            onClick={() => void submit()}
+          >
+            确认创建
           </Button>
         </>
       }
@@ -396,6 +434,7 @@ export function NewPoolDialog({
         <Field label="成员订阅源" hint="排在前面的订阅源优先：节点重名时保留先出现的那个。">
           {() => (
             <MultiCombobox
+              label="成员订阅源"
               value={ids}
               onChange={setIds}
               options={options}
@@ -409,21 +448,22 @@ export function NewPoolDialog({
         <Field label="按标签自动加入" optional hint="带这些标签的订阅源会自动加入，以后新加的也一样。">
           {() => (
             <div className="flex flex-col gap-2">
-              <TagInput value={tags} onChange={setTags} validate={validateTag} placeholder="输入标签，回车添加" />
+              <TagInput aria-label="自动加入标签" value={tags} onChange={setTags} validate={validateTag} placeholder="输入标签，回车添加" />
               {allTags.filter((t) => !tags.includes(t)).length > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5 text-xs text-ink-3">
                   现有标签：
                   {allTags
                     .filter((t) => !tags.includes(t))
                     .map((tag) => (
-                      <button
+                      <UiButton
                         key={tag}
                         type="button"
+                        aria-label={`添加标签 ${tag}`}
                         onClick={() => setTags([...tags, tag])}
                         className="rounded-md border border-line bg-surface px-1.5 py-px text-ink-2 hover:border-line-strong hover:text-ink"
                       >
                         + {tag}
-                      </button>
+                      </UiButton>
                     ))}
                 </div>
               )}

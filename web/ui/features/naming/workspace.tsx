@@ -3,19 +3,25 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { AlertTriangle, Layers, SearchX, Undo2, Wand2 } from 'lucide-react';
+import { AlertTriangle, Layers, PowerOff, SearchX, Undo2, Wand2 } from 'lucide-react';
 import { validateTemplate } from '@/lib/proxies/naming';
+import { NodeFactsSchema } from '@/schemas/nodeFacts';
 import { ApiError, errorMessage } from '@/ui/data/api';
 import { refreshShared } from '@/ui/data/hooks';
 import { useHotkey } from '@/ui/shell/hotkeys';
 import { Block, Page, PageHeader, SaveBar } from '@/ui/shell/page';
 import { profilePath } from '@/ui/shell/scope';
-import { Badge, Button, Card, Code, confirmAction, EmptyState, Monogram, notify, Skeleton } from '@/ui/primitives';
+import { Badge, Button, Card, Code, confirmAction, EmptyState, notify, Skeleton } from '@/ui/primitives';
+import { NamingHeaderMeta } from './header-meta';
 import { TemplateComposer } from './composer';
+import { NamingCandidates, applyNamingCandidate } from './candidates';
+import type { GroupingPurpose } from '@/lib/proxies/namingGroupGeneration';
 import {
   applyPlan,
   isVersionConflict,
   rollbackPlan,
+  disablePlan,
+  recognizeNodeFacts,
   useCurrentNames,
   useDebounced,
   useNamingPreview,
@@ -25,6 +31,8 @@ import {
   activationOf,
   buildRows,
   fieldStats,
+  namingApplyFeedback,
+  namingUndoFeedback,
   planBody,
   ruleError,
   samePlan,
@@ -93,8 +101,10 @@ function Workspace({
   ws: ReturnType<typeof useNamingWorkspace>;
 }) {
   const [plan, setPlan] = useState<NamingPlan>(() => storedPlan(data));
-  const [busy, setBusy] = useState<'apply' | 'rollback' | null>(null);
-  const [rulesOpen, setRulesOpen] = useState(() => (data.managed.recognitionRules?.length ?? 0) > 0);
+  const [busy, setBusy] = useState<'apply' | 'rollback' | 'disable' | 'recognize' | null>(null);
+  const [rulesOpen, setRulesOpen] = useState(
+    () => (data.managed.recognitionRules?.length ?? 0) > 0,
+  );
   const [aliasesOpen, setAliasesOpen] = useState(false);
 
   const stored = useMemo(() => storedPlan(data), [data]);
@@ -113,6 +123,11 @@ function Workspace({
   const preview = useNamingPreview(type, id, version, debouncedJson ?? planJson);
   const current = useCurrentNames(type, id, version);
   const stats = useMemo(() => fieldStats(data.health), [data.health]);
+  const memberWarnings = preview.data ? preview.data.issues.flatMap((issue) =>
+    issue.code === 'member-post-template-rename' && 'memberId' in issue && 'message' in issue
+      ? [{ memberId: String(issue.memberId), message: String(issue.message) }]
+      : [],
+  ) : data.diagnostics.memberWarnings ?? [];
 
   const summary = useMemo(() => (preview.data ? summarizeIssues(preview.data.issues) : null), [preview.data]);
   const table = useMemo(() => {
@@ -133,13 +148,34 @@ function Workspace({
     notify.warn('配置刚被其他操作修改', '已刷新到最新状态，你的改动还在。请再看一眼预览，然后重新应用。');
   };
 
+  const applyCandidate = async (template: string, title: string, groupingPurposes?: GroupingPurpose[]) => {
+    if (busy) return;
+    setBusy('apply');
+    try {
+      const next = await applyNamingCandidate(type, id, template, data.configVersion, groupingPurposes);
+      ws.mutate(next);
+      setPlan(storedPlan(next));
+      refreshShared();
+      const undo = namingUndoFeedback(next.priorPlan.createdGroups);
+      notify.success(namingApplyFeedback(title, groupingPurposes !== undefined), undo.description, {
+        label: undo.label, onClick: () => void restore(next.configVersion),
+      });
+    } catch (error) {
+      if (isVersionConflict(error)) await onConflict();
+      else notify.error(error, '应用失败');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const apply = async () => {
     if (!applyable) return;
     const orphans = summary?.orphans ?? [];
     const ok = await confirmAction({
       title: activation === 'enabled' ? '应用新的命名方案？' : '启用智能命名？',
       tone: orphans.length ? 'danger' : 'default',
-      confirmText: activation === 'enabled' ? '应用' : '启用',
+      confirmText: activation === 'enabled' ? '确认应用' : '确认启用',
+      confirmHint: '应用后将重写节点名称，客户端下次更新订阅时生效',
       description: (
         <span className="flex flex-col gap-2">
           <span>
@@ -175,23 +211,31 @@ function Workspace({
 
   const rollback = async () => {
     const prior = data.priorPlan;
+    const undo = namingUndoFeedback(prior.createdGroups);
     const ok = await confirmAction({
       title: '撤销上次应用？',
       tone: 'danger',
-      confirmText: '撤销',
-      description: prior.template ? (
+      confirmText: '确认撤销',
+      confirmHint: '撤销上次应用的命名方案并恢复迁移前的引用',
+      description: (
         <span className="flex flex-col gap-2">
-          <span>命名会恢复为上一次的方案：</span>
-          <Code className="break-all">{prior.template}</Code>
+          {prior.template ? <>
+            <span>命名会恢复为上一次的方案：</span>
+            <Code className="break-all">{prior.template}</Code>
+            <span>如该方案迁移过策略组筛选或精确引用，也会一并恢复；已被后续编辑的项不会被覆盖。</span>
+          </> : <span>上次应用之前没有启用智能命名，撤销后节点会恢复原来的名字。如有策略组筛选或引用迁移，也会一并恢复。</span>}
+          {undo.description && <span className="text-bad">{undo.description}</span>}
         </span>
-      ) : (
-        '上次应用之前没有启用智能命名，撤销后节点会恢复原来的名字。'
       ),
     });
     if (!ok) return;
+    await restore(data.configVersion);
+  };
+
+  const restore = async (expectedVersion: number) => {
     setBusy('rollback');
     try {
-      const next = await rollbackPlan(type, id, data.configVersion);
+      const next = await rollbackPlan(type, id, expectedVersion);
       ws.mutate(next);
       setPlan(storedPlan(next));
       refreshShared();
@@ -204,7 +248,58 @@ function Workspace({
     }
   };
 
+  const disable = async () => {
+    const ok = await confirmAction({
+      title: '关闭智能命名？',
+      tone: 'danger',
+      confirmText: '确认关闭',
+      confirmHint: '关闭后节点恢复原始名称',
+      description: (
+        <span className="flex flex-col gap-2">
+          <span>节点会恢复上游原来的名字。当前的命名方案会保留，之后点「重新启用」或「撤销上次应用」即可恢复。</span>
+          <span className="text-warn">如果有策略组筛选或规则依赖统一后的名字（例如按「美国」匹配），关闭后可能匹配不到节点；保存前会先校验配置，校验不过不会写入。</span>
+        </span>
+      ),
+    });
+    if (!ok) return;
+    setBusy('disable');
+    try {
+      const next = await disablePlan(type, id, data.configVersion);
+      ws.mutate(next);
+      setPlan(storedPlan(next));
+      refreshShared();
+      notify.success('智能命名已关闭', '客户端下次更新订阅时会看到原始节点名。');
+    } catch (error) {
+      if (isVersionConflict(error)) await onConflict();
+      else notify.error(error, '关闭失败');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   useHotkey('mod+s', () => void apply(), { enabled: applyable });
+
+  const recognize = async () => {
+    setBusy('recognize');
+    try {
+      const result = await recognizeNodeFacts(data.entity.ref);
+      const nodeFacts = NodeFactsSchema.parse({
+        ...plan.nodeFacts,
+        ...Object.fromEntries(
+          Object.entries(result.nodeFacts).map(([fingerprint, facts]) => [
+            fingerprint,
+            { ...plan.nodeFacts?.[fingerprint], ...facts },
+          ]),
+        ),
+      });
+      setPlan((current) => ({ ...current, nodeFacts }));
+      notify.success(`已识别 ${result.proposed} 个节点`, '请核对改名预览，再应用改动。');
+    } catch (error) {
+      notify.error(error, '节点识别失败');
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const addRule = (rule: RecognitionRule) => {
     setPlan((p) => ({ ...p, recognitionRules: [...p.recognitionRules, rule] }));
@@ -227,14 +322,8 @@ function Workspace({
         back={back}
         documentTitle={`智能命名 · ${data.entity.label}`}
         eyebrow={
-          <>
-            <Monogram name={data.entity.label} size={18} />
-            <span className="font-medium text-ink-2">{data.entity.label}</span>
-            <span className="text-ink-4">·</span>
-            <span>{KIND_LABEL[type]}</span>
-            <span className="text-ink-4">·</span>
-            <span className="tnum">{data.diagnostics.nodeCount} 个节点</span>
-          </>
+          <NamingHeaderMeta label={data.entity.label} kindLabel={KIND_LABEL[type]}
+            nodeCount={data.diagnostics.nodeCount} infoFiltered={data.diagnostics.infoFiltered} />
         }
         title={
           <span className="flex items-center gap-3">
@@ -245,6 +334,18 @@ function Workspace({
         description="把杂乱的节点名统一成同一种格式，例如「🇭🇰 香港 01 · IPLC」；订阅更新后的新节点也会自动套用。"
         actions={
           <>
+            <Button
+              loading={busy === 'recognize'}
+              disabled={!!busy}
+              onClick={() => void recognize()}
+            >
+              AI 识别节点
+            </Button>
+            {activation === 'enabled' && (
+              <Button icon={PowerOff} loading={busy === 'disable'} disabled={!!busy} onClick={() => void disable()}>
+                关闭智能命名
+              </Button>
+            )}
             {data.priorPlan.present && (
               <Button icon={Undo2} loading={busy === 'rollback'} disabled={!!busy} onClick={() => void rollback()}>
                 撤销上次应用
@@ -274,10 +375,11 @@ function Workspace({
           ) : (
             <span>暂时没有配置文件用到它</span>
           )}
-          {activation === 'disabled' && <span className="text-warn">· 命名步骤在处理流程里被停用了，应用后会重新启用</span>}
+          {activation === 'disabled' && <span className="text-warn">· 智能命名已关闭，节点使用原始名字；点「重新启用」恢复</span>}
         </div>
       </PageHeader>
 
+      <NamingCandidates type={type} id={id} version={data.configVersion} busy={!!busy} onApply={applyCandidate} />
       <div className="grid gap-6 @3xl/main:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] @3xl/main:grid-rows-[auto_1fr]">
         <div className="min-w-0 animate-rise @3xl/main:col-start-1 @3xl/main:row-start-1">
           <TemplateComposer
@@ -297,6 +399,7 @@ function Workspace({
             paired={table?.paired ?? true}
             summary={summary}
             total={preview.data?.after.count ?? null}
+            infoFiltered={preview.data?.infoFiltered ?? 0}
             truncated={!!preview.data?.after.truncated}
             loading={!preview.data && !preview.error}
             validating={preview.isValidating || (!!planJson && planJson !== debouncedJson)}
@@ -332,18 +435,25 @@ function Workspace({
               </Section>
             </div>
           </Block>
+          {memberWarnings.map((warning) => (
+            <div key={warning.memberId} role="status" className="rounded-lg border border-line p-3 text-sm text-warn">
+              {warning.memberId}: {warning.message}
+            </div>
+          ))}
           <CoverageCard health={data.health} rulesDiffer={rulesDiffer} onSuggestRule={addRule} />
         </div>
       </div>
 
-      <SaveBar
-        visible={dirty}
-        onSave={() => void apply()}
-        onDiscard={() => setPlan(stored)}
-        saving={busy === 'apply'}
-        message={activation === 'enabled' ? '命名方案有改动，尚未应用' : '方案已调整，应用后才会生效'}
-        saveLabel={activation === 'enabled' ? '应用' : '启用'}
-      />
+      <div data-agent-hidden>
+        <SaveBar
+          visible={dirty}
+          onSave={() => void apply()}
+          onDiscard={() => setPlan(stored)}
+          saving={busy === 'apply'}
+          message={activation === 'enabled' ? '命名方案有改动，尚未应用' : '方案已调整，应用后才会生效'}
+          saveLabel={activation === 'enabled' ? '应用' : '启用'}
+        />
+      </div>
     </Page>
   );
 }

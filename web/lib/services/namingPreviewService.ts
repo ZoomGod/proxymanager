@@ -1,10 +1,9 @@
 /**
  * namingPreviewService — the shared zero-write naming preview path.
  *
- * Workspace UI preview, assistant confirmation preview and the generic
- * preview routes all derive their managed candidate from the SAME builder
- * (namingManagedCandidate) and run the SAME zero-write pipeline preview
- * functions (pipelinePreview.ts). Preview never saves: no fetch-cache
+ * Workspace UI and assistant confirmation share the managed candidate builder.
+ * The workspace uses the same zero-write projection as the admin preview
+ * routes. Preview never saves: no fetch-cache
  * writes, no ordinal persistence, no CAS, no audit.
  */
 
@@ -17,6 +16,7 @@ import {
   type OrdinalPlanningSession,
 } from '@/lib/services/nodeOrdinalService';
 import { sourceOf } from '@/lib/proxies/provenance';
+import { collectionMemberNamingWarnings } from '@/lib/proxies/collectionNaming';
 import { buildOperatorSnapshot } from '@/lib/repos/rawOperators';
 import {
   isActiveCurrentRenameTemplateOperator,
@@ -42,6 +42,7 @@ import { enabledCollectionMemberSubs } from '@/lib/engine/resolve';
 import type { Operator, StoredOperator } from '@/schemas';
 
 export interface NamingPreviewResult {
+  infoFiltered: number;
   after: NamesPayload;
   issues: PreviewIssue[];
   candidate: { id: string; index: number; mode: 'added' | 'replaced' | 'kept' };
@@ -82,7 +83,7 @@ export function decodeCandidate(candidateOperators: readonly unknown[]): StoredO
 export async function previewNamingSubscription(
   id: string,
   candidateOperators: readonly unknown[],
-): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[] }> {
+): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[]; infoFiltered: number }> {
   const sub = await getSubscription(id);
   if (!sub) throw ProblemDetailsError.notFound('目标不存在或不在当前配置文件的来源范围内。');
   // the candidate may preserve parked/primitive raw rows — decode once and
@@ -111,16 +112,16 @@ export async function previewNamingSubscription(
 export async function previewNamingCollection(
   id: string,
   candidateOperators: readonly unknown[],
-): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[] }> {
+): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[]; infoFiltered: number }> {
   const collection = await getCollection(id);
   if (!collection) throw ProblemDetailsError.notFound('目标不存在或不在当前配置文件的来源范围内。');
   const subs = await listSubscriptions();
   const planningSession = await createOrdinalPlanningSession(subs.map((sub) => sub.name));
-  const { merged } = await mergeCollectionMemberProxies(collection, subs, {
+  const decoded = decodeCandidate(candidateOperators);
+  const { merged } = await mergeCollectionMemberProxies({ ...collection, operators: decoded }, subs, {
     writeCache: false,
     ordinalPlanningSession: planningSession,
   });
-  const decoded = decodeCandidate(candidateOperators);
   // the SAME per-item dedup predicate the generic collection preview route
   // uses: a candidate active collection-level rename-template manages every
   // node; otherwise each member's own saved managed op decides its nodes
@@ -132,7 +133,7 @@ export async function previewNamingCollection(
     ]),
   );
   const before = merged as ClashProxy[];
-  return runCandidatePreview(
+  const result = await runCandidatePreview(
     before,
     decoded,
     (item) => {
@@ -143,6 +144,10 @@ export async function previewNamingCollection(
     (proxy) => sourceOf(proxy),
     planningSession,
   );
+  result.issues.push(...collectionMemberNamingWarnings(
+    enabledCollectionMemberSubs(collection, subs), collectionManagedOp,
+  ));
+  return result;
 }
 
 async function runCandidatePreview(
@@ -151,7 +156,7 @@ async function runCandidatePreview(
   managedPredicate: (item: unknown) => boolean,
   identityOf: (proxy: unknown) => { key: string; label: string } | undefined,
   planningSession: OrdinalPlanningSession,
-): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[] }> {
+): Promise<{ before: NamesPayload; after: NamesPayload; issues: PreviewIssue[]; infoFiltered: number }> {
   const managedOp = decoded.find(isActiveCurrentRenameTemplateOperator);
   const ordinals = await resolveOrdinalsFor(before, identityOf, {
     persist: false,
@@ -163,6 +168,7 @@ async function runCandidatePreview(
   const final = dedupExportProxies(after, managedPredicate);
   const dedupIssues = dedupMachineIssues(final);
   return {
+    infoFiltered: steps.reduce((sum, step) => sum + (step.infoFiltered ?? 0), 0),
     before: namesPayload(before),
     after: namesPayload(final.proxies),
     issues: [...(await buildPreviewIssues(before, final.proxies, steps)), ...dedupIssues],

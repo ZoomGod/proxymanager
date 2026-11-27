@@ -3,6 +3,7 @@ import { installTestHandleSecret } from '../helpers/handleSecret';
 import { DEFAULT_PROFILE_NAME } from '@/schemas';
 import { buildTargetRefScope } from '@/lib/proxies/handleScopes';
 import { GLOBAL_NAMING_SCOPE_ID } from '@/lib/services/namingTargetScope';
+import { nodeFingerprint } from '@/lib/proxies/naming';
 
 /** Test-local ref helper: a complete one-target domain. */
 const refOf = (type: 'subscription' | 'collection', id: string): string =>
@@ -134,6 +135,56 @@ beforeAll(() => {
 });
 
 describe('POST /api/v1/assistant/naming-analysis', () => {
+  it('offers node facts using the stored model endpoint, names only, without persisting proposals', async () => {
+    scalars.set(REDIS_KEYS.assistantConfig, {
+      baseUrl: 'https://api.deepseek.com',
+      model: 'deepseek-chat',
+      apiKey: 'cfg-key-123',
+    });
+    const fetcher = await import('@/lib/services/subscriptionFetcher');
+    const proxy = {
+      name: 'mystery transit',
+      type: 'ss',
+      server: 'private.invalid',
+      port: 443,
+      password: 'never-send-this',
+    };
+    vi.mocked(fetcher.resolveSubscriptionProxiesRaw).mockResolvedValueOnce({
+      proxies: [proxy],
+      proxyCount: 1,
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () => '',
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                nodes: [{ i: 0, facts: { region: 'HK', tags: ['IEPL'] } }],
+              }),
+            },
+          },
+        ],
+      }),
+    });
+    const before = JSON.stringify(bucket(REDIS_KEYS.subscriptions).get(SUB_ID));
+    const res = await POST(request({ ref: SUB_REF(), mode: 'node-facts' }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      data: {
+        nodeFacts: { [nodeFingerprint(proxy)!]: { region: 'HK', tags: ['IEPL'] } },
+        proposed: 1,
+      },
+    });
+    expect(JSON.stringify(bucket(REDIS_KEYS.subscriptions).get(SUB_ID))).toBe(before);
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(JSON.parse(sent.messages[1].content)).toEqual([{ i: 0, name: 'mystery transit' }]);
+    expect(JSON.stringify(sent)).not.toContain('private.invalid');
+    expect(JSON.stringify(sent)).not.toContain('never-send-this');
+  });
+
   it('accepts a global workspace ref even when the active profile does not consume the target', async () => {
     scalars.set(REDIS_KEYS.assistantConfig, {
       baseUrl: 'https://api.deepseek.com',
@@ -185,7 +236,7 @@ describe('POST /api/v1/assistant/naming-analysis', () => {
     expect(JSON.parse(init.body).model).toBe('custom-model-7b');
   });
 
-  it('round-1: sanitized names + labels reach the model bounded; credentials/stable keys never do', async () => {
+  it('bounded names and sanitized labels reach the model; connection fields and stable keys do not', async () => {
     scalars.set(REDIS_KEYS.assistantConfig, {
       baseUrl: 'https://api.deepseek.com',
       model: 'deepseek-v4-pro',
@@ -219,7 +270,7 @@ describe('POST /api/v1/assistant/naming-analysis', () => {
     const raw = fetcher.resolveSubscriptionProxiesRaw as unknown as ReturnType<typeof vi.fn>;
     raw.mockResolvedValueOnce({
       proxies: [
-        { name: 'BenignUniqueNodeName', type: 'ss', server: 'n1.invalid', port: 443 },
+        { name: 'BenignUniqueNodeName [HK-01]', type: 'ss', server: 'n1.invalid', port: 443 },
         { name: '机场甲 专线A', type: 'vmess', server: 'n2.invalid', port: 8443 },
         { name: '香港 01', type: 'trojan', server: 'n3.invalid', port: 443 },
       ],
@@ -243,7 +294,7 @@ describe('POST /api/v1/assistant/naming-analysis', () => {
       // round-1: the returned privacy payload KEEPS the sanitized original
       // names (useful display content) and stays free of connection fields
       const returned = JSON.stringify(payload);
-      for (const seed of ['BenignUniqueNodeName', '机场甲', '专线A', '香港 01']) {
+      for (const seed of ['BenignUniqueNodeName [HK-01]', '机场甲', '专线A', '香港 01']) {
         expect(returned, `returned payload should keep ${seed}`).toContain(seed);
       }
       for (const seed of ['n1.invalid', '8443', 'n2.invalid', 'n3.invalid']) {
@@ -254,7 +305,7 @@ describe('POST /api/v1/assistant/naming-analysis', () => {
       // the MODEL MESSAGE keeps the useful names and is free of the seeds
       const [, init] = fetchMock.mock.calls[0] as [string, { body: string }];
       const sent = init.body;
-      for (const seed of ['BenignUniqueNodeName', '机场甲', '专线A', '香港 01']) {
+      for (const seed of ['BenignUniqueNodeName [HK-01]', '机场甲', '专线A', '香港 01']) {
         expect(sent, `model message should keep ${seed}`).toContain(seed);
       }
       for (const seed of ['n1.invalid', '8443', 'n2.invalid', 'n3.invalid']) {

@@ -19,6 +19,8 @@
  *     API response.
  */
 
+import type { NodeRecognitionFacts, RecognitionRule } from './naming';
+
 export interface SourceIdentity {
   /** Stable source key — the subscription slug (`name`). Used for alias overrides. */
   key: string;
@@ -31,10 +33,23 @@ export interface SourceIdentity {
  * ever enter management responses, assistant payloads or serialised configs.
  */
 export interface NodeEnvelope {
+  renderedNaming?: {
+    stale?: boolean;
+    facts: NodeRecognitionFacts;
+    template: string;
+    tw2cn?: boolean;
+    sourceLabel?: string;
+  };
+  memberNaming?: {
+    facts?: NodeRecognitionFacts;
+    recognitionRules?: RecognitionRule[];
+    sourceAlias?: string;
+  };
   /** The node's source subscription identity. */
   source?: SourceIdentity;
   /** Original name at the raw fetch boundary (pre-any-operator). */
   rawName?: string;
+  subscriptionInfo?: true;
   /**
    * Immutable raw-identity fingerprint: canonical hash over the node's
    * connection-defining config as fetched upstream. Computed ONCE at the

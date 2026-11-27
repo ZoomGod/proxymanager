@@ -33,6 +33,25 @@ export interface HealthView {
 export function sourceHealth(source: Pick<SubscriptionAdminView, 'kind' | 'enabled' | 'fetch_health' | 'refresh_mode' | 'manual_snapshot'>): HealthView {
   if (!source.enabled) return { tone: 'idle', badge: 'neutral', label: '已停用', detail: '停用的源不会被拉取，也不会提供节点。' };
   if (source.kind === 'local') return { tone: 'ok', badge: 'neutral', label: '本地', detail: '节点内容保存在本平台，无需拉取。' };
+  if (source.refresh_mode === 'server-manual') {
+    const snap = source.manual_snapshot;
+    if (!snap) {
+      return {
+        tone: 'idle',
+        badge: 'neutral',
+        label: '待刷新',
+        detail: '已关闭自动刷新，还没有缓存节点，请激活订阅后手动点击「手动刷新」。',
+      };
+    }
+    const originLabel =
+      snap.origin === 'extension' ? '通过浏览器扩展导入' : snap.origin === 'web' ? '通过网页导入' : '手动刷新';
+    return {
+      tone: snap.source_changed ? 'warn' : 'ok',
+      badge: snap.source_changed ? 'warn' : 'ok',
+      label: '仅手动刷新',
+      detail: `${relativeTime(snap.updated_at)}${originLabel} · ${snap.proxy_count} 个节点 · 永久缓存${snap.source_changed ? ' · 拉取参数已变更，建议手动刷新' : ''}`,
+    };
+  }
   if (source.refresh_mode === 'manual') {
     const snap = source.manual_snapshot;
     if (!snap) return { tone: 'bad', badge: 'bad', label: '待导入', detail: '手动维护的源还没有导入内容。' };
@@ -104,17 +123,25 @@ export function TrafficMeter({
 }) {
   const used = traffic.upload + traffic.download;
   const unlimited = traffic.total <= 0;
-  const ratio = unlimited ? 0 : Math.min(1, used / traffic.total);
+  const showBar = !unlimited && traffic.remaining === undefined && !traffic.expiry_only;
+  const ratio = showBar ? Math.min(1, used / traffic.total) : 0;
   const days = traffic.expire > 0 ? daysUntil(traffic.expire) : null;
   const barColor = ratio > 0.9 ? 'var(--bad)' : ratio > 0.75 ? 'var(--warn)' : 'var(--ink)';
   return (
     <div className={cn('flex flex-col gap-1.5', className)}>
       <div className="flex items-baseline justify-between gap-2 text-xs">
-        <span className="tnum text-ink-2">
-          <span className="font-medium text-ink">{formatBytes(used)}</span>
-          {!unlimited && <span className="text-ink-3"> / {formatBytes(traffic.total)}</span>}
-          {unlimited && <span className="text-ink-3"> 已用 · 不限量</span>}
-        </span>
+        {!traffic.expiry_only && (
+          <span className="tnum text-ink-2">
+            <span className="font-medium text-ink">{formatBytes(traffic.remaining ?? used)}</span>
+            {traffic.remaining !== undefined ? (
+              <span className="text-ink-3"> 剩余</span>
+            ) : !unlimited ? (
+              <span className="text-ink-3"> / {formatBytes(traffic.total)}</span>
+            ) : (
+              <span className="text-ink-3">{traffic.total_unknown ? ' 已用' : ' 已用 · 不限量'}</span>
+            )}
+          </span>
+        )}
         {days !== null && (
           <span
             className={cn('tnum shrink-0', days < 0 ? 'text-bad' : days <= 7 ? 'text-warn' : 'text-ink-3')}
@@ -124,7 +151,7 @@ export function TrafficMeter({
           </span>
         )}
       </div>
-      {!unlimited && (
+      {showBar && (
         <div className={cn('relative overflow-hidden rounded-full bg-surface-3', compact ? 'h-1' : 'h-1.5')}>
           <motion.div
             className="absolute inset-y-0 left-0 rounded-full"

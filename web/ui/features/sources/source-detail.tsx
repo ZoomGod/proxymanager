@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { Check, Download, Link2, MoreHorizontal, Power, PowerOff, RadioTower, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
+import { DataView } from '@/ui/agent';
 import { errorMessage } from '@/ui/data/api';
 import { refreshShared, useSource, useSources } from '@/ui/data/hooks';
 import { formatDate, relativeTime } from '@/ui/lib/format';
@@ -11,6 +12,7 @@ import { Badge, Button, Card, EmptyState, Menu, Monogram, notify, Skeleton, TabP
 import { Page, PageHeader } from '@/ui/shell/page';
 import { HealthPill, sourceHealth, TrafficMeter, trafficOf } from '@/ui/viz/health';
 import { PipelineEditor } from '@/ui/pipeline/pipeline-editor';
+import { NamingLink, NamingSetupPrompt } from './naming-entry';
 import { deleteSource, patchSource, refreshSource, setSourceEnabled } from './actions';
 import { ManualImportDialog } from './manual-import';
 import { canServerRefresh, msToMinutes, sourceLink, sourceMode, sourceTitle, type Source } from './model';
@@ -20,7 +22,7 @@ import { DistributionPanel, NodesPanel, TAB_SCROLL, UsagePanel, useSubBase, useT
 const TABS = ['nodes', 'pipeline', 'settings', 'usage', 'share'] as const;
 
 function Facts({ source }: { source: Source }) {
-  const traffic = trafficOf(source.fetch_health);
+  const traffic = source.traffic ?? trafficOf(source.fetch_health) ?? source.manual_snapshot?.traffic;
   const health = source.fetch_health;
   const mode = sourceMode(source);
   const cells: Array<{ label: string; value: React.ReactNode }> = [];
@@ -31,28 +33,45 @@ function Facts({ source }: { source: Source }) {
     });
     cells.push({ label: '缓存时长', value: `${msToMinutes(source.ttl_ms)} 分钟` });
     cells.push({ label: '拉取失败时', value: source.fetch_failure_policy === 'fail-closed' ? '阻断' : '沿用缓存' });
+  } else if (mode === 'server-manual') {
+    cells.push({ label: '上次刷新', value: source.manual_snapshot ? relativeTime(source.manual_snapshot.updated_at) : '还没有' });
+    cells.push({ label: '缓存策略', value: '永久缓存（仅手动刷新）' });
+    cells.push({ label: '缓存节点', value: source.manual_snapshot ? `${source.manual_snapshot.proxy_count} 个` : '—' });
   } else if (mode === 'manual') {
     cells.push({ label: '上次导入', value: source.manual_snapshot ? relativeTime(source.manual_snapshot.updated_at) : '还没有' });
     cells.push({ label: '导入节点', value: source.manual_snapshot ? `${source.manual_snapshot.proxy_count} 个` : '—' });
   }
   if (!traffic && cells.length === 0) return null;
+  const factItems = [
+    ...(traffic
+      ? [
+          {
+            value: 'traffic',
+            label: `流量：已用 ${Math.round(((traffic.upload + traffic.download) / Math.max(traffic.total || 1, 1)) * 100)}%${traffic.expire > 0 ? ` · ${formatDate(traffic.expire)} 到期` : ''}`,
+          },
+        ]
+      : []),
+    ...cells.map((cell) => ({ value: cell.label, label: `${cell.label}：${String(cell.value)}` })),
+  ];
   return (
-    <Card className="grid gap-px overflow-hidden bg-line sm:grid-cols-[1.4fr_repeat(3,1fr)]">
-      {traffic && (
-        <div className="bg-surface px-4 py-3">
-          <div className="mb-1.5 text-2xs text-ink-3">
-            流量{traffic.expire > 0 ? ` · ${formatDate(traffic.expire)} 到期` : ''}
+    <DataView label="订阅源概览" summary={factItems.map((i) => i.label).join('；')} items={factItems}>
+      <Card className="grid gap-px overflow-hidden bg-line sm:grid-cols-[1.4fr_repeat(3,1fr)]">
+        {traffic && (
+          <div className="bg-surface px-4 py-3">
+            <div className="mb-1.5 text-2xs text-ink-3">
+              流量{traffic.expire > 0 ? ` · ${formatDate(traffic.expire)} 到期` : ''}
+            </div>
+            <TrafficMeter traffic={traffic} />
           </div>
-          <TrafficMeter traffic={traffic} />
-        </div>
-      )}
-      {cells.map((cell) => (
-        <div key={cell.label} className="bg-surface px-4 py-3">
-          <div className="text-2xs text-ink-3">{cell.label}</div>
-          <div className="tnum mt-1 text-[13px] font-medium text-ink">{cell.value}</div>
-        </div>
-      ))}
-    </Card>
+        )}
+        {cells.map((cell) => (
+          <div key={cell.label} className="bg-surface px-4 py-3">
+            <div className="text-2xs text-ink-3">{cell.label}</div>
+            <div className="tnum mt-1 text-[13px] font-medium text-ink">{cell.value}</div>
+          </div>
+        ))}
+      </Card>
+    </DataView>
   );
 }
 
@@ -67,6 +86,7 @@ export function SourceDetail() {
   const { copied, copy } = useCopy();
   const [busy, setBusy] = useState<'refresh' | 'mode' | null>(null);
   const [importing, setImporting] = useState(false);
+  const [pipelineDirty, setPipelineDirty] = useState(false);
 
   if (!source) {
     if (detail.error) {
@@ -137,6 +157,7 @@ export function SourceDetail() {
             <span>订阅源</span>
             <span className="font-mono text-[11px] text-ink-2">{source.name}</span>
             <Badge tone="outline">{source.kind === 'local' ? '本地' : '远程'}</Badge>
+            {mode === 'server-manual' && <Badge tone="neutral">仅手动刷新</Badge>}
           </>
         }
         title={
@@ -150,7 +171,13 @@ export function SourceDetail() {
             <HealthPill view={health} />
             <span className="text-ink-2">{health.detail}</span>
             {mode === 'manual' && (
-              <Button size="xs" variant="link" loading={busy === 'mode'} onClick={() => void backToAuto()}>
+              <Button
+                size="xs"
+                variant="link"
+                loading={busy === 'mode'}
+                data-agent-confirm={`将「${title}」改回平台自动拉取`}
+                onClick={() => void backToAuto()}
+              >
                 改回平台自动拉取
               </Button>
             )}
@@ -158,17 +185,20 @@ export function SourceDetail() {
         }
         actions={
           <>
+            <NamingLink href={`/sources/${source.id}/naming`} dirty={pipelineDirty} />
             {canServerRefresh(source) && (
               <Button
+                variant={mode === 'server-manual' && !source.manual_snapshot ? 'primary' : undefined}
                 icon={RefreshCw}
                 loading={busy === 'refresh'}
+                data-agent-confirm={`刷新订阅源「${title}」`}
                 onClick={async () => {
                   setBusy('refresh');
                   await refreshSource(source);
                   setBusy(null);
                 }}
               >
-                刷新
+                {mode === 'server-manual' ? '手动刷新' : '刷新'}
               </Button>
             )}
             {mode === 'manual' && source.enabled && (
@@ -181,12 +211,12 @@ export function SourceDetail() {
             </Button>
             <Menu
               items={[
-                ...(mode === 'auto' && source.enabled
+                ...((mode === 'auto' || mode === 'server-manual') && source.enabled
                   ? [{ label: '手动导入…', icon: Download, onSelect: () => setImporting(true) }, 'separator' as const]
                   : []),
                 source.enabled
-                  ? { label: '停用', icon: PowerOff, onSelect: () => void setSourceEnabled(source, false) }
-                  : { label: '启用', icon: Power, onSelect: () => void setSourceEnabled(source, true) },
+                  ? { label: '停用', icon: PowerOff, confirm: `停用订阅源「${title}」`, onSelect: () => void setSourceEnabled(source, false) }
+                  : { label: '启用', icon: Power, confirm: `启用订阅源「${title}」`, onSelect: () => void setSourceEnabled(source, true) },
                 { label: '删除', icon: Trash2, tone: 'danger' as const, onSelect: async () => (await deleteSource(source)) && router.push('/sources') },
               ]}
               trigger={<Button iconOnly icon={MoreHorizontal} aria-label="更多操作" />}
@@ -198,6 +228,7 @@ export function SourceDetail() {
       <div className="flex flex-col gap-6">
         <Facts source={source} />
         <Tabs
+          label="订阅源详情标签页"
           value={tab}
           onValueChange={setTab}
           className={TAB_SCROLL}
@@ -222,11 +253,13 @@ export function SourceDetail() {
             )}
             {visited.has('pipeline') && (
               <TabPanel value="pipeline" forceMount className="outline-none data-[state=inactive]:hidden">
+                <NamingSetupPrompt href={`/sources/${source.id}/naming`} operators={source.operators} dirty={pipelineDirty} />
                 <PipelineEditor
                   target={{ kind: 'subscription', id: source.id }}
                   operators={source.operators}
                   updatedAt={source.updated_at}
                   namingHref={`/sources/${source.id}/naming`}
+                  onDirtyChange={setPipelineDirty}
                   active={tab === 'pipeline'}
                   originHint={source.kind === 'local' ? '来自你粘贴的节点内容' : '拉取并解析订阅后得到的节点'}
                 />

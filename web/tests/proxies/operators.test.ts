@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { applyOperators, type ClashProxy } from '@/lib/proxies/operators';
 import { isSafeRuntimeRegex } from '@/lib/proxies/regexSafety';
+import { envelopeOf } from '@/lib/proxies/provenance';
 import type { Operator, OperatorKind } from '@/schemas/operator';
 
 let seq = 0;
@@ -301,6 +302,13 @@ describe('applyOperators · dedup', () => {
 });
 
 describe('applyOperators · filter-region', () => {
+  it.each([['TW', 'TW01', '台湾'], ['HK', 'HK 02', '香港'], ['MO', 'MO 03', '澳门']])('keeps CN-flagged %s nodes before and after naming', (region, raw, label) => {
+    const names = [`🇨🇳 ${raw}`, `🇨🇳 ${label} · 03`];
+    const { proxies } = applyOperators(names.map((name) => ({ name, type: 'ss' })), [
+      op({ kind: 'filter-region', mode: 'keep', regions: [region] }),
+    ]);
+    expect(proxies.map((p) => p.name)).toEqual(names);
+  });
   it('keeps only selected regions', () => {
     const { proxies } = applyOperators(sample, [
       op({ kind: 'filter-region', mode: 'keep', regions: ['HK'] }),
@@ -332,6 +340,49 @@ describe('applyOperators · pipeline ordering + disabled', () => {
 /* ─── rename-template (名称统一) through the shared pipeline ─────────── */
 
 describe('applyOperators · rename-template', () => {
+  it.each([
+    op({ kind: 'rename-regex', pattern: 'IEPL', replacement: '家宽' }),
+    op({ kind: 'flag-emoji', action: 'remove' }),
+    op({ kind: 'flag-emoji', action: 'add', tw2cn: true }),
+  ])('invalidates renderer facts when a downstream operator edits the name: %j', (edit) => {
+    const { proxies } = applyOperators([{ name: 'TW IEPL 01', type: 'ss' }], [
+      rt({ template: '${emoji} ${region} ${tags} ${index}' }), edit,
+    ]);
+    expect(envelopeOf(proxies[0])?.renderedNaming?.stale).toBe(true);
+  });
+
+  it.each([
+    op({ kind: 'rename-regex', pattern: 'absent', replacement: '家宽' }),
+    op({ kind: 'flag-emoji', action: 'add' }),
+    op({ kind: 'flag-emoji', action: 'remove', disabled: true }),
+    op({ kind: 'set-prop', udp: true }),
+  ])('preserves renderer facts for name-preserving or disabled operators: %j', (edit) => {
+    const { proxies } = applyOperators([{ name: 'TW IEPL 01', type: 'ss' }], [
+      rt({ template: '${emoji} ${region} ${tags} ${index}' }), edit,
+    ]);
+    expect(envelopeOf(proxies[0])?.renderedNaming?.facts.region).toBe('TW');
+    expect(envelopeOf(proxies[0])?.renderedNaming?.stale).not.toBe(true);
+  });
+
+  it('invalidates only edited nodes and refreshes stale facts at the next template', () => {
+    const input = [{ name: 'HK IEPL 01', type: 'ss' }, { name: 'JP BGP 02', type: 'ss' }];
+    const pipeline = [rt({ template: '${region} ${tags} ${index}' }), op({ kind: 'rename-regex', pattern: 'IEPL', replacement: '家宽' })];
+    const changed = applyOperators(input, pipeline).proxies;
+    expect(changed.map((p) => !!envelopeOf(p)?.renderedNaming?.stale)).toEqual([true, false]);
+    const refreshed = applyOperators(input, [...pipeline, rt({ template: '${region} ${tags} ${index}' })]).proxies;
+    expect(envelopeOf(refreshed[0])?.renderedNaming?.facts.tags).toEqual(['家宽']);
+    expect(refreshed.every((p) => !envelopeOf(p)?.renderedNaming?.stale)).toBe(true);
+  });
+
+  it('preserves renderer facts when dedup adds a collision suffix', () => {
+    const input = [{ name: 'TW IEPL 01', type: 'ss', server: 'a.example', port: 443, password: 'one' },
+      { name: 'TW IEPL 02', type: 'ss', server: 'a.example', port: 443, password: 'two' }];
+    const { proxies } = applyOperators(input, [rt({ template: '${region} ${tags} ${index}' }),
+      op({ kind: 'dedup', by: 'server-port', action: 'rename' })]);
+    expect(proxies[1].name).toMatch(/ #2$/);
+    expect(proxies.every((p) => !envelopeOf(p)?.renderedNaming?.stale)).toBe(true);
+    expect(proxies.map((p) => envelopeOf(p)?.renderedNaming?.facts.region)).toEqual(['TW', 'TW']);
+  });
   it('composes deterministic names and reports changed + collisions', () => {
     const input: ClashProxy[] = [
       { name: '🇭🇰 香港 01', type: 'ss' },
@@ -395,7 +446,7 @@ describe('applyOperators · rename-template', () => {
 });
 
 describe('applyOperators · per-step samples', () => {
-  it('captures bounded redacted before/after name samples per applied step', () => {
+  it('captures bounded before/after name samples per applied step', () => {
     const input: ClashProxy[] = [
       { name: '🇭🇰 香港 01', type: 'ss' },
       { name: '日本 Tokyo 01', type: 'ss' },
@@ -415,9 +466,9 @@ describe('applyOperators · per-step samples', () => {
     });
   });
 
-  it('samples are REDACTED — credential-like names never reach the trace raw', () => {
+  it('preserves exact name text without returning connection fields in samples', () => {
     const input: ClashProxy[] = [
-      { name: '香港 https://evil.example/sub?token=abc123', type: 'ss' },
+      { name: '香港 https://evil.example/sub?token=abc123', type: 'ss', server: 'fixture.invalid' },
       { name: '日本 ::1', type: 'ss' },
     ];
     const { steps } = applyOperators(input, [
@@ -426,8 +477,7 @@ describe('applyOperators · per-step samples', () => {
       }),
     ]);
     const serialized = JSON.stringify(steps[0].samples ?? []);
-    expect(serialized).not.toContain('evil.example');
-    expect(serialized).not.toContain('token=abc123');
-    expect(serialized).not.toContain('::1');
+    expect(steps[0].samples?.map((sample) => sample.before)).toEqual(input.map((node) => node.name));
+    expect(serialized).not.toContain('fixture.invalid');
   });
 });

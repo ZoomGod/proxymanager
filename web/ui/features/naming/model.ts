@@ -3,13 +3,58 @@
  * grammar and renderer come from the shared compiler in lib/proxies/naming
  * (no node APIs), so validation here is exactly the server's.
  */
-import { renderTemplate, validateTemplate, type NamingField } from '@/lib/proxies/naming';
+import {
+  renderTemplate,
+  validateTemplate,
+  LINE_TAGS,
+  type NamingField,
+  type NodeFacts,
+} from '@/lib/proxies/naming';
 import type { SourceHealthReport } from '@/lib/proxies/namingHealth';
+import type { NamingCandidate } from '@/lib/proxies/namingCandidates';
+import type { GroupingPreview, GroupingPurpose } from '@/lib/proxies/namingGroupGeneration';
 import { flagFromCode, regionByCode } from '@/lib/proxies/regions';
 import type { NamesPayload, PreviewIssue } from '@/ui/data/types';
 
 export type TargetType = 'subscription' | 'collection';
-export type RuleField = 'route' | 'vendor' | 'region' | 'entry';
+export type RuleField = 'route' | 'vendor' | 'region' | 'entry' | 'tag';
+
+export function groupingSelection(selection: GroupingPurpose[] | null, preview?: GroupingPreview): GroupingPurpose[] {
+  return selection ?? preview?.purposes.filter((p) => p.selected).map((p) => p.id) ?? [];
+}
+
+export function toggleGroupingPurpose(selection: GroupingPurpose[], purpose: GroupingPurpose, checked: boolean): GroupingPurpose[] {
+  return checked ? [...new Set([...selection, purpose])] : selection.filter((id) => id !== purpose);
+}
+
+export function groupingPreviewMatches(preview: GroupingPreview | undefined, selected: GroupingPurpose[]): boolean {
+  if (!preview) return false;
+  const purposes = groupingSelection(null, preview);
+  return purposes.length === selected.length && purposes.every((id) => selected.includes(id));
+}
+
+export function namingUndoFeedback(createdGroups: string[] = []) {
+  return createdGroups.length ? {
+    label: `撤销并移除 ${createdGroups.length} 个策略组`,
+    description: `撤销将移除本次生成的 ${createdGroups.length} 个策略组：${[...new Set(createdGroups)].join('、')}。`,
+  } : { label: '撤销', description: undefined };
+}
+
+export function namingApplyFeedback(title: string, grouping: boolean): string {
+  return grouping ? '命名和策略组已生成' : `「${title.trim() || '命名方案'}」已应用`;
+}
+
+export function candidateRationale(candidate: NamingCandidate): string {
+  const changed = candidate.groups.filter((g) => g.broken || g.error || g.before !== (g.migration?.after ?? g.after)).length;
+  const migrated = candidate.groups.filter((g) => g.migration).length;
+  const blocked = candidate.references.filter((ref) => ref.blocked).length;
+  const reason = !candidate.groups.length ? '没有策略组，无需迁移筛选'
+    : changed ? `${changed} 个策略组的成员或匹配数会变化，需核对`
+      : migrated ? `${migrated} 个筛选将迁移，所有策略组匹配数不变`
+        : '无需改写任何筛选，所有策略组匹配数不变';
+  return reason + (blocked ? `；${blocked} 处精确引用无法自动迁移`
+    : candidate.references.length ? `；${candidate.references.length} 处精确引用将同步改写` : '');
+}
 
 export interface RecognitionRule {
   pattern: string;
@@ -18,6 +63,7 @@ export interface RecognitionRule {
 }
 
 export interface NamingPlan {
+  nodeFacts?: NodeFacts;
   template: string;
   tw2cn: boolean;
   /** Keys are the opaque `src-…` handles round-tripped from GET. */
@@ -26,6 +72,7 @@ export interface NamingPlan {
 }
 
 export interface PlanView {
+  nodeFacts?: NodeFacts;
   present: boolean;
   template?: string;
   tw2cn?: boolean;
@@ -46,11 +93,13 @@ export interface NamingWorkspaceData {
   entity: { type: TargetType; ref: string; label: string };
   aggregate: boolean;
   managed: PlanView;
-  priorPlan: PlanView;
+  priorPlan: PlanView & { createdGroups?: string[] };
   recommended: string;
   health: SourceHealthReport[];
   diagnostics: {
+    memberWarnings?: Array<{ memberId: string; message: string }>;
     nodeCount: number;
+    infoFiltered: number;
     changed: number;
     collisions: string[];
     deduped: Array<{ kept: string; dropped: string; sourceKey?: string }>;
@@ -65,6 +114,7 @@ export interface NamingWorkspaceData {
 }
 
 export interface NamingPreviewData {
+  infoFiltered: number;
   after: NamesPayload;
   issues: PreviewIssue[];
   candidate: { id: string; index: number; mode: 'added' | 'replaced' | 'kept' };
@@ -86,6 +136,11 @@ export const FIELD_META: Record<NamingField, { label: string; hint: string; exam
   vendor: { label: '服务商', hint: '常见机场品牌，认不出就留空', example: 'TAG' },
   entry: { label: '入口', hint: '节点名写了「入口」时才有', example: '入口' },
   note: { label: '剩余文字', hint: '原名去掉已识别部分后剩下的文字', example: 'Premium' },
+  tags: {
+    label: '线路标签',
+    hint: '标准线路标签，按固定顺序以空格分隔',
+    example: 'IEPL 专线 原生',
+  },
 };
 
 export const FIELD_ORDER: NamingField[] = [
@@ -100,12 +155,14 @@ export const FIELD_ORDER: NamingField[] = [
   'vendor',
   'entry',
   'note',
+  'tags',
 ];
 
 /** Fields the system assigns itself — always available. */
 export const ASSIGNED_FIELDS: ReadonlySet<NamingField> = new Set(['source', 'index']);
 
 export const RULE_FIELDS: Array<{ value: RuleField; label: string }> = [
+  { value: 'tag', label: '标签' },
   { value: 'route', label: '线路' },
   { value: 'vendor', label: '服务商' },
   { value: 'region', label: '地区' },
@@ -223,6 +280,7 @@ export function storedPlan(data: NamingWorkspaceData): NamingPlan {
     tw2cn: m.tw2cn === true,
     sourceAliases: { ...(m.sourceAliases ?? {}) },
     recognitionRules: (m.recognitionRules ?? []).map((r) => ({ ...r })),
+    ...(m.nodeFacts !== undefined ? { nodeFacts: m.nodeFacts } : {}),
   };
 }
 
@@ -240,6 +298,7 @@ const isBlankRule = (r: RecognitionRule) => r.pattern === '' && r.value.trim() =
 /** The complete, explicit body sent to preview/apply (every policy field present). */
 export function planBody(plan: NamingPlan): NamingPlan {
   return {
+    ...(plan.nodeFacts !== undefined ? { nodeFacts: plan.nodeFacts } : {}),
     template: plan.template,
     tw2cn: plan.tw2cn,
     sourceAliases: cleanAliases(plan.sourceAliases),
@@ -261,6 +320,7 @@ function canonical(plan: NamingPlan) {
 }
 
 export function ruleError(rule: RecognitionRule): string | null {
+  if (rule.field === 'tag' && !LINE_TAGS.some((tag) => tag === rule.value)) return '请选择标准标签';
   if (isBlankRule(rule)) return null;
   if (!rule.pattern) return '填写要匹配的文字';
   if (rule.pattern.length > 100) return '匹配内容最多 100 个字符';

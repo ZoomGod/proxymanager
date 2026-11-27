@@ -9,7 +9,7 @@ import {
 } from '@/lib/repos/fetchCacheRepo';
 import { safeJsonStringify } from '@/lib/security/safeJson';
 import type { OrdinalReservationPlan } from '@/lib/services/nodeOrdinalService';
-import { MAX_SUBSCRIPTION_CONTENT, SubscriptionSchema, type Subscription } from '@/schemas';
+import { MAX_SUBSCRIPTION_CONTENT, SubscriptionSchema, type Subscription, type SubscriptionTraffic } from '@/schemas';
 
 /**
  * Subscription-specific, fail-first CAS.
@@ -97,7 +97,7 @@ if entityAction == 'set' then
       return {2, 'remote-actions-malformed'}
     end
     local mode = entity.refresh_mode or 'server-auto'
-    if mode ~= 'server-auto' and mode ~= 'manual' then
+    if mode ~= 'server-auto' and mode ~= 'server-manual' and mode ~= 'manual' then
       return {2, 'refresh-mode-malformed'}
     end
     local meta = entity.manual_snapshot_meta
@@ -105,7 +105,9 @@ if entityAction == 'set' then
       if type(meta) ~= 'table' or
          not isSafeUnsignedNumber(meta.updated_at) or
          not isSafeUnsignedNumber(meta.proxy_count) or meta.proxy_count < 1 or
-         (meta.origin ~= 'web' and meta.origin ~= 'extension') or
+         (meta.info_proxy_count ~= nil and
+          (not isSafeUnsignedNumber(meta.info_proxy_count) or meta.info_proxy_count > meta.proxy_count)) or
+         (meta.origin ~= 'web' and meta.origin ~= 'extension' and meta.origin ~= 'server') or
          not isSafeUnsignedNumber(meta.fetch_identity_revision) or
          type(meta.content_sha256) ~= 'string' or
          string.len(meta.content_sha256) ~= 64 or
@@ -117,10 +119,13 @@ if entityAction == 'set' then
     if mode == 'manual' and meta == nil then
       return {2, 'manual-snapshot-meta-missing'}
     end
-    if snapshotAction == 'set' and mode ~= 'manual' then
+    if snapshotAction == 'set' and mode ~= 'manual' and mode ~= 'server-manual' then
       return {2, 'snapshot-mode-mismatch'}
     end
-    if mode == 'manual' and snapshotAction == 'keep' and not redis.call('GET', KEYS[6]) then
+    if snapshotAction == 'set' and meta == nil then
+      return {2, 'manual-snapshot-meta-missing'}
+    end
+    if (mode == 'manual' or (mode == 'server-manual' and meta ~= nil)) and snapshotAction == 'keep' and not redis.call('GET', KEYS[6]) then
       return {2, 'manual-snapshot-missing'}
     end
   else
@@ -469,21 +474,40 @@ export async function listSubscriptions(): Promise<Subscription[]> {
   return subscriptions;
 }
 
-/** Legacy bodies are scanned at most once per configuration version / cache window. */
-export async function listSubscriptionSummaries(): Promise<Subscription[]> {
+export interface StoredSubscriptionInfo {
+  proxyCount: number;
+  traffic?: SubscriptionTraffic;
+}
+
+type SubscriptionSummary = Subscription & { storedInfo?: StoredSubscriptionInfo };
+
+/** Bodies are read on cache misses only and are never included in summaries. */
+export async function listSubscriptionSummaries(
+  readStoredInfo?: (sub: Subscription) => Promise<StoredSubscriptionInfo | undefined>,
+): Promise<SubscriptionSummary[]> {
   const redis = getRedis();
   for (let attempt = 0; attempt < 3; attempt++) {
     const version = (await redis.get<number>(REDIS_KEYS.configVersion)) ?? 0;
-    const key = `subscription-summaries:v1:${version}`;
-    const cached = await redis.get<Subscription[]>(key);
+    const key = readStoredInfo
+      ? `subscription-summaries-with-info:v5:${version}`
+      : `subscription-summaries:v1:${version}`;
+    const cached = await redis.get<SubscriptionSummary[]>(key);
     if (Array.isArray(cached)) return cached;
-    const subscriptions = await listSubscriptionMetadata();
-    if (((await redis.get<number>(REDIS_KEYS.configVersion)) ?? 0) !== version) continue;
-    const summaries = subscriptions.map((sub) => {
+    const subscriptions = await (readStoredInfo ? listSubscriptions() : listSubscriptionMetadata());
+    const summaries: SubscriptionSummary[] = subscriptions.map((sub) => {
       const summary = { ...sub };
       delete summary.content;
       return summary;
     });
+    if (readStoredInfo) {
+      for (let start = 0; start < subscriptions.length; start += 8) {
+        await Promise.all(subscriptions.slice(start, start + 8).map(async (sub, offset) => {
+          const info = await readStoredInfo(sub);
+          if (info) summaries[start + offset].storedInfo = info;
+        }));
+      }
+    }
+    if (((await redis.get<number>(REDIS_KEYS.configVersion)) ?? 0) !== version) continue;
     await redis.set(key, summaries, { ex: 60 });
     return summaries;
   }
